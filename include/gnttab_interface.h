@@ -163,6 +163,47 @@ typedef VOID
     IN  PXENBUS_GNTTAB_CACHE    Cache
     );
 
+/*! \typedef XENBUS_GNTTAB_MAP_FOREIGN_PAGES
+    \brief Map foreign memory pages into the IO space
+
+    \param Interface The interface header
+    \param Domain The domid of the domain that granted the page
+    \param NumberPages Number of pages to map
+    \param References Array of grant reference numbers shared by the foreign domain
+    \param ReadOnly If set, pages are mapped with read-only access
+    \param Address The physical address that the foreign pages are mapped under
+    (allocated from the PCI IO space)
+    \param Handles An array of tracking numbers that represent the mapping
+    of each individual page
+*/
+
+typedef NTSTATUS
+(*XENBUS_GNTTAB_MAP_FOREIGN_PAGES)(
+    IN  PINTERFACE              Interface,
+    IN  USHORT                  Domain,
+    IN  ULONG                   NumberPages,
+    IN  PULONG                  References,
+    IN  BOOLEAN                 ReadOnly,
+    OUT PHYSICAL_ADDRESS        *Address,
+    OUT ULONG                   *Handles
+    );
+
+/*! \typedef XENBUS_GNTTAB_UNMAP_FOREIGN_PAGES
+\brief Unmap a foreign memory page from the given physical address
+
+\param Interface The interface header
+\param NumberPages Number of pages to unmap
+\param Address The physical address that the foreign pages are mapped under
+\param Handles An array of tracking numbers that represent the mapping
+*/
+typedef NTSTATUS
+(*XENBUS_GNTTAB_UNMAP_FOREIGN_PAGES)(
+    IN  PINTERFACE              Interface,
+    IN  ULONG                   NumberPages,
+    IN  PHYSICAL_ADDRESS        Address,
+    IN  PULONG                  Handles
+    );
+
 // {763679C5-E5C2-4A6D-8B88-6BB02EC42D8E}
 DEFINE_GUID(GUID_XENBUS_GNTTAB_INTERFACE, 
 0x763679c5, 0xe5c2, 0x4a6d, 0x8b, 0x88, 0x6b, 0xb0, 0x2e, 0xc4, 0x2d, 0x8e);
@@ -182,7 +223,24 @@ struct _XENBUS_GNTTAB_INTERFACE_V1 {
     XENBUS_GNTTAB_DESTROY_CACHE         GnttabDestroyCache;
 };
 
-typedef struct _XENBUS_GNTTAB_INTERFACE_V1 XENBUS_GNTTAB_INTERFACE, *PXENBUS_GNTTAB_INTERFACE;
+/*! \struct _XENBUS_GNTTAB_INTERFACE_V2
+\brief GNTTAB interface version 2 (added map/unmap foreign pages)
+\ingroup interfaces
+*/
+struct _XENBUS_GNTTAB_INTERFACE_V2 {
+    INTERFACE                           Interface;
+    XENBUS_GNTTAB_ACQUIRE               GnttabAcquire;
+    XENBUS_GNTTAB_RELEASE               GnttabRelease;
+    XENBUS_GNTTAB_CREATE_CACHE          GnttabCreateCache;
+    XENBUS_GNTTAB_PERMIT_FOREIGN_ACCESS GnttabPermitForeignAccess;
+    XENBUS_GNTTAB_REVOKE_FOREIGN_ACCESS GnttabRevokeForeignAccess;
+    XENBUS_GNTTAB_GET_REFERENCE         GnttabGetReference;
+    XENBUS_GNTTAB_DESTROY_CACHE         GnttabDestroyCache;
+    XENBUS_GNTTAB_MAP_FOREIGN_PAGES     GnttabMapForeignPages;
+    XENBUS_GNTTAB_UNMAP_FOREIGN_PAGES   GnttabUnmapForeignPages;
+};
+
+typedef struct _XENBUS_GNTTAB_INTERFACE_V2 XENBUS_GNTTAB_INTERFACE, *PXENBUS_GNTTAB_INTERFACE;
 
 /*! \def XENBUS_GNTTAB
     \brief Macro at assist in method invocation
@@ -193,7 +251,6 @@ typedef struct _XENBUS_GNTTAB_INTERFACE_V1 XENBUS_GNTTAB_INTERFACE, *PXENBUS_GNT
 #endif  // _WINDLL
 
 #define XENBUS_GNTTAB_INTERFACE_VERSION_MIN 1
-#define XENBUS_GNTTAB_INTERFACE_VERSION_MAX 1
+#define XENBUS_GNTTAB_INTERFACE_VERSION_MAX 2
 
 #endif  // _XENBUS_GNTTAB_INTERFACE_H
-

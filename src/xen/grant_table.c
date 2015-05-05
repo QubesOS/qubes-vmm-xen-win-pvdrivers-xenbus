@@ -131,3 +131,88 @@ fail1:
 
     return status;
 }
+
+__checkReturn
+XEN_API
+NTSTATUS
+GrantTableMapForeignPage(
+    IN  USHORT                  Domain,
+    IN  ULONG                   GrantRef,
+    IN  PHYSICAL_ADDRESS        Address,
+    IN  BOOLEAN                 ReadOnly,
+    OUT ULONG                   *Handle
+    )
+{
+    struct gnttab_map_grant_ref op;
+    LONG_PTR rc;
+    NTSTATUS status;
+
+    RtlZeroMemory(&op, sizeof(op));
+    op.dom = Domain;
+    op.ref = GrantRef;
+    op.flags = GNTMAP_host_map;
+    if (ReadOnly)
+        op.flags |= GNTMAP_readonly;
+    op.host_addr = Address.QuadPart;
+
+    rc = GrantTableOp(GNTTABOP_map_grant_ref, &op, 1);
+
+    if (rc < 0) {
+        ERRNO_TO_STATUS(-rc, status);
+        goto fail1;
+    }
+
+    if (op.status != GNTST_okay) {
+        status = STATUS_UNSUCCESSFUL;
+        goto fail2;
+    }
+
+    *Handle = op.handle;
+
+    return STATUS_SUCCESS;
+
+fail2:
+    Error("op.status = %d\n", op.status);
+fail1:
+    Error("fail1 (%08x)\n", status);
+
+    return status;
+}
+
+__checkReturn
+XEN_API
+NTSTATUS
+GrantTableUnmapForeignPage(
+    IN  ULONG                   Handle,
+    IN  PHYSICAL_ADDRESS        Address
+    )
+{
+    struct gnttab_unmap_grant_ref op;
+    LONG_PTR rc;
+    NTSTATUS status;
+
+    RtlZeroMemory(&op, sizeof(op));
+    op.handle = Handle;
+    op.host_addr = Address.QuadPart;
+
+    rc = GrantTableOp(GNTTABOP_unmap_grant_ref, &op, 1);
+
+    if (rc < 0) {
+        ERRNO_TO_STATUS(-rc, status);
+        goto fail1;
+    }
+
+    if (op.status != GNTST_okay) {
+        status = STATUS_UNSUCCESSFUL;
+        goto fail2;
+    }
+
+    return STATUS_SUCCESS;
+
+fail2:
+    Error("op.status = %d\n", op.status);
+fail1:
+    Error("fail1 (%08x)\n", status);
+
+    return status;
+}

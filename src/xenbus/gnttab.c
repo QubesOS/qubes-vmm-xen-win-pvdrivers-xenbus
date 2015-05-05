@@ -534,6 +534,100 @@ GnttabGetReference(
     return (ULONG)Entry->Reference;
 }
 
+static NTSTATUS
+GnttabMapForeignPages(
+    IN  PINTERFACE              Interface,
+    IN  USHORT                  Domain,
+    IN  ULONG                   NumberPages,
+    IN  PULONG                  References,
+    IN  BOOLEAN                 ReadOnly,
+    OUT PHYSICAL_ADDRESS        *Address,
+    OUT ULONG                   *Handles
+    )
+{
+    NTSTATUS                    status;
+    PXENBUS_GNTTAB_CONTEXT      Context = Interface->Context;
+    ULONG                       PageIndex;
+    PHYSICAL_ADDRESS            PageAddress;
+    BOOLEAN                     Leak = FALSE;
+
+    status = FdoAllocateIoSpace(Context->Fdo, NumberPages * PAGE_SIZE, Address);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    PageAddress.QuadPart = Address->QuadPart;
+
+    for (PageIndex = 0; PageIndex < NumberPages; PageIndex++) {
+        status = GrantTableMapForeignPage(Domain,
+                                          References[PageIndex],
+                                          PageAddress,
+                                          ReadOnly,
+                                          &(Handles[PageIndex]));
+        if (!NT_SUCCESS(status))
+            goto fail2;
+
+        PageAddress.QuadPart += PAGE_SIZE;
+    }
+
+    return STATUS_SUCCESS;
+
+fail2:
+    Error("fail2: PageIndex = %lu, PageAddress = %p, Handle = %lu\n", PageAddress.QuadPart, Handles[PageIndex]);
+
+    while (PageIndex > 0) {
+        --PageIndex;
+        PageAddress.QuadPart -= PAGE_SIZE;
+
+        if (!NT_SUCCESS(GrantTableUnmapForeignPage(Handles[PageIndex], PageAddress))) {
+            // can't reuse the memory since it's still mapped in a foreign domain
+            Error("failed to unmap handle %lu at %p, leaking the whole range\n", Handles[PageIndex], PageAddress.QuadPart);
+            Leak = TRUE;
+        }
+    }
+
+    if (!Leak)
+        FdoFreeIoSpace(Context->Fdo, *Address, NumberPages * PAGE_SIZE);
+    else
+        Error("Leaking io memory: physical address %p, size 0x%lx\n", *Address, NumberPages * PAGE_SIZE);
+
+fail1:
+    Error("fail1: (%08x)\n", status);
+    return status;
+}
+
+static NTSTATUS
+GnttabUnmapForeignPages(
+    IN  PINTERFACE              Interface,
+    IN  ULONG                   NumberPages,
+    IN  PHYSICAL_ADDRESS        Address,
+    IN  PULONG                  Handles
+    )
+{
+    NTSTATUS                    status;
+    PXENBUS_GNTTAB_CONTEXT      Context = Interface->Context;
+    ULONG                       PageIndex;
+    PHYSICAL_ADDRESS            PageAddress;
+
+    PageAddress.QuadPart = Address.QuadPart;
+
+    for (PageIndex = 0; PageIndex < NumberPages; PageIndex++) {
+        status = GrantTableUnmapForeignPage(Handles[PageIndex],
+                                            PageAddress);
+        if (!NT_SUCCESS(status))
+            goto fail1;
+
+        PageAddress.QuadPart += PAGE_SIZE;
+    }
+
+    FdoFreeIoSpace(Context->Fdo, Address, NumberPages * PAGE_SIZE);
+    return STATUS_SUCCESS;
+
+fail1:
+    Error("fail1: (%08x), leaking memory at %p, size 0x%lx. PageIndex = %lu, PageAddress = %p, Handle = %lu\n",
+          status, Address.QuadPart, NumberPages * PAGE_SIZE, PageIndex, PageAddress.QuadPart, Handles[PageIndex]);
+    return status;
+}
+
 static VOID
 GnttabSuspendCallbackEarly(
     IN  PVOID               Argument
@@ -779,7 +873,7 @@ done:
 }
 
 static struct _XENBUS_GNTTAB_INTERFACE_V1   GnttabInterfaceVersion1 = {
-    { sizeof (struct _XENBUS_GNTTAB_INTERFACE_V1), 1, NULL, NULL, NULL },
+    { sizeof(struct _XENBUS_GNTTAB_INTERFACE_V1), 1, NULL, NULL, NULL },
     GnttabAcquire,
     GnttabRelease,
     GnttabCreateCache,
@@ -788,7 +882,20 @@ static struct _XENBUS_GNTTAB_INTERFACE_V1   GnttabInterfaceVersion1 = {
     GnttabGetReference,
     GnttabDestroyCache
 };
-                     
+
+static struct _XENBUS_GNTTAB_INTERFACE_V2   GnttabInterfaceVersion2 = {
+    { sizeof(struct _XENBUS_GNTTAB_INTERFACE_V2), 2, NULL, NULL, NULL },
+    GnttabAcquire,
+    GnttabRelease,
+    GnttabCreateCache,
+    GnttabPermitForeignAccess,
+    GnttabRevokeForeignAccess,
+    GnttabGetReference,
+    GnttabDestroyCache,
+    GnttabMapForeignPages,
+    GnttabUnmapForeignPages
+};
+
 NTSTATUS
 GnttabInitialize(
     IN  PXENBUS_FDO             Fdo,
@@ -867,10 +974,27 @@ GnttabGetInterface(
         GnttabInterface = (struct _XENBUS_GNTTAB_INTERFACE_V1 *)Interface;
 
         status = STATUS_BUFFER_OVERFLOW;
-        if (Size < sizeof (struct _XENBUS_GNTTAB_INTERFACE_V1))
+        if (Size < sizeof(struct _XENBUS_GNTTAB_INTERFACE_V1))
             break;
 
         *GnttabInterface = GnttabInterfaceVersion1;
+
+        ASSERT3U(Interface->Version, ==, Version);
+        Interface->Context = Context;
+
+        status = STATUS_SUCCESS;
+        break;
+    }
+    case 2: {
+        struct _XENBUS_GNTTAB_INTERFACE_V2  *GnttabInterface;
+
+        GnttabInterface = (struct _XENBUS_GNTTAB_INTERFACE_V2 *)Interface;
+
+        status = STATUS_BUFFER_OVERFLOW;
+        if (Size < sizeof(struct _XENBUS_GNTTAB_INTERFACE_V2))
+            break;
+
+        *GnttabInterface = GnttabInterfaceVersion2;
 
         ASSERT3U(Interface->Version, ==, Version);
         Interface->Context = Context;
