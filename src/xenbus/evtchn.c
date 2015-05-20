@@ -879,6 +879,35 @@ EvtchnGetPort(
     return Channel->LocalPort;
 }
 
+static NTSTATUS
+EvtchnStatus(
+    IN  PINTERFACE              Interface,
+    IN  PXENBUS_EVTCHN_CHANNEL  Channel,
+    OUT ULONG                   *Status
+    )
+{
+    KIRQL                       Irql;
+    NTSTATUS                    status;
+
+    UNREFERENCED_PARAMETER(Interface);
+
+    ASSERT3U(Channel->Magic, ==, XENBUS_EVTCHN_CHANNEL_MAGIC);
+
+    // Make sure we don't suspend
+    KeRaiseIrql(DISPATCH_LEVEL, &Irql);
+
+    status = STATUS_UNSUCCESSFUL;
+    if (!Channel->Active)
+        goto done;
+
+    status = EventChannelStatus(Channel->LocalPort, Status);
+
+done:
+    KeLowerIrql(Irql);
+
+    return status;
+}
+
 static
 _Function_class_(KSERVICE_ROUTINE)
 __drv_requiresIRQL(HIGH_LEVEL)
@@ -1470,7 +1499,21 @@ static struct _XENBUS_EVTCHN_INTERFACE_V4 EvtchnInterfaceVersion4 = {
     EvtchnSend,
     EvtchnTrigger,
     EvtchnGetPort,
-    EvtchnClose
+    EvtchnClose,
+};
+
+static struct _XENBUS_EVTCHN_INTERFACE_V5 EvtchnInterfaceVersion5 = {
+    { sizeof(struct _XENBUS_EVTCHN_INTERFACE_V5), 5, NULL, NULL, NULL },
+    EvtchnAcquire,
+    EvtchnRelease,
+    EvtchnOpen,
+    EvtchnBind,
+    EvtchnUnmask,
+    EvtchnSend,
+    EvtchnTrigger,
+    EvtchnGetPort,
+    EvtchnClose,
+    EvtchnStatus,
 };
 
 NTSTATUS
@@ -1644,6 +1687,23 @@ EvtchnGetInterface(
         *EvtchnInterface = EvtchnInterfaceVersion4;
 
         ASSERT3U(Interface->Version, ==, Version);
+        Interface->Context = Context;
+
+        status = STATUS_SUCCESS;
+        break;
+    }
+    case 5: {
+        struct _XENBUS_EVTCHN_INTERFACE_V5  *EvtchnInterface;
+
+        EvtchnInterface = (struct _XENBUS_EVTCHN_INTERFACE_V5 *)Interface;
+
+        status = STATUS_BUFFER_OVERFLOW;
+        if (Size < sizeof(struct _XENBUS_EVTCHN_INTERFACE_V5))
+            break;
+
+        *EvtchnInterface = EvtchnInterfaceVersion5;
+
+        ASSERT3U(Interface->Version, == , Version);
         Interface->Context = Context;
 
         status = STATUS_SUCCESS;
