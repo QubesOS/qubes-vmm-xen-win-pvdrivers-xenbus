@@ -236,6 +236,73 @@ fail1:
     return status;
 }
 
+// prepare request with known number of elements
+static NTSTATUS
+StorePrepareRequestFixed(
+    IN  PXENBUS_STORE_CONTEXT       Context,
+    OUT PXENBUS_STORE_REQUEST       Request,
+    IN  PXENBUS_STORE_TRANSACTION   Transaction OPTIONAL,
+    IN  enum xsd_sockmsg_type       Type,
+    IN  PXENBUS_STORE_SEGMENT       Segments,
+    IN  ULONG                       NumberSegments
+    )
+{
+    ULONG                           Id;
+    KIRQL                           Irql;
+    NTSTATUS                        status;
+    ULONG                           Index;
+
+    ASSERT(IsZeroMemory(Request, sizeof (XENBUS_STORE_REQUEST)));
+
+    status = STATUS_INVALID_PARAMETER;
+    if (NumberSegments > XENBUS_STORE_REQUEST_SEGMENT_COUNT - 1) // need one for header
+        goto fail1;
+
+    if (Transaction != NULL) {
+        status = STATUS_UNSUCCESSFUL;
+        if (!Transaction->Active)
+            goto fail2;
+
+        Id = Transaction->Id;
+    } else {
+        Id = 0;
+    }
+
+    Request->Header.type = Type;
+    Request->Header.tx_id = Id;
+    Request->Header.len = 0;
+
+    KeAcquireSpinLock(&Context->Lock, &Irql);
+    Request->Header.req_id = Context->RequestId++;
+    KeReleaseSpinLock(&Context->Lock, Irql);
+
+    // header is the first, then the actual data
+    Request->Count = NumberSegments + 1;
+
+    Request->Segment[0].Data = (PCHAR)&Request->Header;
+    Request->Segment[0].Offset = 0;
+    Request->Segment[0].Length = sizeof(struct xsd_sockmsg);
+
+    for (Index = 0; Index < NumberSegments; Index++) {
+        Request->Segment[Index+1].Data = Segments[Index].Data;
+        Request->Segment[Index+1].Offset = 0;
+        Request->Segment[Index+1].Length = Segments[Index].Length;
+
+        Request->Header.len += Segments[Index].Length;
+    }
+
+    Request->State = XENBUS_STORE_REQUEST_PREPARED;
+
+    return STATUS_SUCCESS;
+
+fail2:
+    Error("fail2\n");
+
+fail1:
+    Error("fail1 (%08x)\n", status);
+    return status;
+}
+
 static ULONG
 StoreCopyToRing(
     IN  PXENBUS_STORE_CONTEXT           Context,
@@ -439,7 +506,6 @@ StoreIgnoreHeaderType(
     case XS_RELEASE:
     case XS_GET_DOMAIN_PATH:
     case XS_MKDIR:
-    case XS_SET_PERMS:
     case XS_IS_DOMAIN_INTRODUCED:
     case XS_RESUME:
     case XS_SET_TARGET:
@@ -467,6 +533,7 @@ StoreVerifyHeader(
         Header->type != XS_TRANSACTION_END &&
         Header->type != XS_WRITE &&
         Header->type != XS_RM &&
+        Header->type != XS_SET_PERMS &&
         Header->type != XS_WATCH_EVENT &&
         Header->type != XS_ERROR &&
         !StoreIgnoreHeaderType(Header->type)) {
@@ -1788,6 +1855,138 @@ StorePoll(
     KeReleaseSpinLockFromDpcLevel(&Context->Lock);
 }
 
+static NTSTATUS
+StorePermissionToString(
+    IN  PXENBUS_STORE_PERMISSION Permission,
+    IN  ULONG BufferSize,
+    OUT PCHAR Buffer
+    )
+{
+    NTSTATUS status = STATUS_INVALID_PARAMETER;
+
+    ASSERT(BufferSize > 1);
+
+    // see http://xenbits.xen.org/docs/4.5-testing/misc/xenstore.txt
+
+    switch (Permission->Mask) {
+    case XS_PERM_WRITE:
+        *Buffer = 'w';
+        break;
+    case XS_PERM_READ:
+        *Buffer = 'r';
+        break;
+    case XS_PERM_READ | XS_PERM_WRITE:
+        *Buffer = 'b';
+        break;
+    case XS_PERM_NONE:
+        *Buffer = 'n';
+        break;
+    default:
+        goto fail1;
+    }
+
+    return RtlStringCbPrintfA(Buffer + 1, BufferSize - 1, "%d", Permission->Domain);
+
+fail1:
+    Error("fail1 (%08x)\n", status);
+    return status;
+}
+
+static NTSTATUS
+StorePermissionsSet(
+    IN  PINTERFACE                  Interface,
+    IN  PXENBUS_STORE_TRANSACTION   Transaction OPTIONAL,
+    IN  PCHAR                       Prefix OPTIONAL,
+    IN  PCHAR                       Node,
+    IN  PXENBUS_STORE_PERMISSION    Permissions,
+    IN  ULONG                       NumberPermissions
+    )
+{
+    PXENBUS_STORE_CONTEXT           Context = Interface->Context;
+    XENBUS_STORE_REQUEST            Request;
+    PXENBUS_STORE_RESPONSE          Response;
+    NTSTATUS                        status;
+    XENBUS_STORE_SEGMENT            Segments[XENBUS_STORE_REQUEST_SEGMENT_COUNT];
+    ULONG                           Index, BufferSize;
+
+    ASSERT(Prefix == NULL); // FIXME
+
+    status = STATUS_INVALID_PARAMETER;
+    if (NumberPermissions > XENBUS_STORE_REQUEST_SEGMENT_COUNT - 2) // 1 for path, 1 for header in StorePrepareRequestFixed
+        goto fail1;
+
+    RtlZeroMemory(&Request, sizeof(XENBUS_STORE_REQUEST));
+    RtlZeroMemory(Segments, sizeof(Segments));
+
+    Segments[0].Data = Node; // path
+    Segments[0].Offset = 0;
+    Segments[0].Length = (ULONG)strlen(Node) + 1; // zero terminator required
+
+    BufferSize = 16;
+    for (Index = 0; Index < NumberPermissions; Index++) {
+        Segments[Index + 1].Data = __StoreAllocate(BufferSize);
+        if (Segments[Index + 1].Data == NULL)
+            goto fail2;
+
+        status = StorePermissionToString(&Permissions[Index], BufferSize, Segments[Index+1].Data);
+        if (!NT_SUCCESS(status))
+            goto fail3;
+
+        Segments[Index + 1].Length = (ULONG)strlen(Segments[Index + 1].Data) + 1; // zero terminator required
+    }
+
+    status = StorePrepareRequestFixed(Context,
+                                      &Request,
+                                      Transaction,
+                                      XS_SET_PERMS,
+                                      Segments,
+                                      NumberPermissions + 1);
+
+    if (!NT_SUCCESS(status))
+        goto fail4;
+
+    Response = StoreSubmitRequest(Context, &Request);
+
+    status = STATUS_NO_MEMORY;
+    if (Response == NULL)
+        goto fail5;
+
+    status = StoreCheckResponse(Response);
+    if (!NT_SUCCESS(status))
+        goto fail6;
+
+    StoreFreeResponse(Response);
+    ASSERT(IsZeroMemory(&Request, sizeof(XENBUS_STORE_REQUEST)));
+    for (Index = 0; Index < NumberPermissions; Index++)
+        __StoreFree(Segments[Index + 1].Data);
+
+    return STATUS_SUCCESS;
+
+fail6:
+    Error("fail6\n");
+    StoreFreeResponse(Response);
+
+fail5:
+    Error("fail3\n");
+
+fail4:
+    Error("fail4\n");
+
+fail3:
+    Error("fail3\n");
+
+fail2:
+    Error("fail2\n");
+    for (Index = 0; Index < NumberPermissions; Index++)
+        if (Segments[Index + 1].Data != NULL)
+            __StoreFree(Segments[Index + 1].Data);
+
+ fail1:
+    Error("fail1 (%08x)\n", status);
+    ASSERT(IsZeroMemory(&Request, sizeof(XENBUS_STORE_REQUEST)));
+    return status;
+}
+
 static
 _Function_class_(KSERVICE_ROUTINE)
 _IRQL_requires_(HIGH_LEVEL)
@@ -2282,9 +2481,26 @@ static struct _XENBUS_STORE_INTERFACE_V1 StoreInterfaceVersion1 = {
     StoreTransactionEnd,
     StoreWatchAdd,
     StoreWatchRemove,
-    StorePoll
+    StorePoll,
 };
                      
+static struct _XENBUS_STORE_INTERFACE_V2 StoreInterfaceVersion2 = {
+    { sizeof(struct _XENBUS_STORE_INTERFACE_V2), 2, NULL, NULL, NULL },
+    StoreAcquire,
+    StoreRelease,
+    StoreFree,
+    StoreRead,
+    StorePrintf,
+    StoreRemove,
+    StoreDirectory,
+    StoreTransactionStart,
+    StoreTransactionEnd,
+    StoreWatchAdd,
+    StoreWatchRemove,
+    StorePoll,
+    StorePermissionsSet,
+};
+
 NTSTATUS
 StoreInitialize(
     IN  PXENBUS_FDO             Fdo,
@@ -2379,6 +2595,23 @@ StoreGetInterface(
         *StoreInterface = StoreInterfaceVersion1;
 
         ASSERT3U(Interface->Version, ==, Version);
+        Interface->Context = Context;
+
+        status = STATUS_SUCCESS;
+        break;
+    }
+    case 2: {
+        struct _XENBUS_STORE_INTERFACE_V2  *StoreInterface;
+
+        StoreInterface = (struct _XENBUS_STORE_INTERFACE_V2 *)Interface;
+
+        status = STATUS_BUFFER_OVERFLOW;
+        if (Size < sizeof(struct _XENBUS_STORE_INTERFACE_V2))
+            break;
+
+        *StoreInterface = StoreInterfaceVersion2;
+
+        ASSERT3U(Interface->Version, == , Version);
         Interface->Context = Context;
 
         status = STATUS_SUCCESS;
