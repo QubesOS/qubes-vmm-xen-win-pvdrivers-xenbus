@@ -1908,12 +1908,23 @@ StorePermissionsSet(
     NTSTATUS                        status;
     XENBUS_STORE_SEGMENT            Segments[XENBUS_STORE_REQUEST_SEGMENT_COUNT];
     ULONG                           Index, BufferSize;
-
-    ASSERT(Prefix == NULL); // FIXME
+    PCHAR                           Path = NULL;
 
     status = STATUS_INVALID_PARAMETER;
     if (NumberPermissions > XENBUS_STORE_REQUEST_SEGMENT_COUNT - 2) // 1 for path, 1 for header in StorePrepareRequestFixed
         goto fail1;
+
+    if (Prefix != NULL) {
+        // we're concatenating it here instead of passing to StorePrepareRequestFixed to reduce the number of segments used
+        status = STATUS_NO_MEMORY;
+        Path = __StoreAllocate(XENSTORE_ABS_PATH_MAX);
+        if (Path == NULL)
+            goto fail2;
+
+        status = RtlStringCbPrintfA(Path, XENSTORE_ABS_PATH_MAX, "%s/%s", Prefix, Node);
+        ASSERT(NT_SUCCESS(status));
+        Node = Path;
+    }
 
     RtlZeroMemory(&Request, sizeof(XENBUS_STORE_REQUEST));
     RtlZeroMemory(Segments, sizeof(Segments));
@@ -1926,11 +1937,11 @@ StorePermissionsSet(
     for (Index = 0; Index < NumberPermissions; Index++) {
         Segments[Index + 1].Data = __StoreAllocate(BufferSize);
         if (Segments[Index + 1].Data == NULL)
-            goto fail2;
+            goto fail3;
 
         status = StorePermissionToString(&Permissions[Index], BufferSize, Segments[Index+1].Data);
         if (!NT_SUCCESS(status))
-            goto fail3;
+            goto fail4;
 
         Segments[Index + 1].Length = (ULONG)strlen(Segments[Index + 1].Data) + 1; // zero terminator required
     }
@@ -1943,45 +1954,55 @@ StorePermissionsSet(
                                       NumberPermissions + 1);
 
     if (!NT_SUCCESS(status))
-        goto fail4;
+        goto fail5;
 
     Response = StoreSubmitRequest(Context, &Request);
 
     status = STATUS_NO_MEMORY;
     if (Response == NULL)
-        goto fail5;
+        goto fail6;
 
     status = StoreCheckResponse(Response);
     if (!NT_SUCCESS(status))
-        goto fail6;
+        goto fail7;
 
     StoreFreeResponse(Response);
     ASSERT(IsZeroMemory(&Request, sizeof(XENBUS_STORE_REQUEST)));
     for (Index = 0; Index < NumberPermissions; Index++)
         __StoreFree(Segments[Index + 1].Data);
 
+    if (Path != NULL)
+        __StoreFree(Path);
+
     return STATUS_SUCCESS;
+
+fail7:
+    Error("fail7\n");
+    StoreFreeResponse(Response);
 
 fail6:
     Error("fail6\n");
-    StoreFreeResponse(Response);
 
 fail5:
-    Error("fail3\n");
+    Error("fail5\n");
 
 fail4:
     Error("fail4\n");
 
 fail3:
     Error("fail3\n");
-
-fail2:
-    Error("fail2\n");
     for (Index = 0; Index < NumberPermissions; Index++)
         if (Segments[Index + 1].Data != NULL)
             __StoreFree(Segments[Index + 1].Data);
 
- fail1:
+    if (Path != NULL)
+        __StoreFree(Path);
+
+fail2:
+    Error("fail2\n");
+
+
+fail1:
     Error("fail1 (%08x)\n", status);
     ASSERT(IsZeroMemory(&Request, sizeof(XENBUS_STORE_REQUEST)));
     return status;
