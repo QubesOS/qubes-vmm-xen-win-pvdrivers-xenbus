@@ -205,12 +205,12 @@ typedef VOID
     IN  PXENBUS_EVTCHN_CHANNEL  Channel
     );
 
-/*! \typedef XENBUS_EVTCHN_STATE
-    \brief Get the channel state
+/*! \typedef XENBUS_EVTCHN_STATUS
+    \brief Get the channel status
 
     \param Interface The interface header
     \param Channel The channel handle
-    \param State The channel state (EVTCHNSTAT_*)
+    \param Status The channel status (EVTCHNSTAT_*)
 */
 typedef NTSTATUS
 (*XENBUS_EVTCHN_STATUS)(
