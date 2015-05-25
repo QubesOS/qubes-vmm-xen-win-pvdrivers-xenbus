@@ -1885,7 +1885,7 @@ StorePermissionToString(
         goto fail1;
     }
 
-    return RtlStringCbPrintfA(Buffer + 1, BufferSize - 1, "%d", Permission->Domain);
+    return RtlStringCbPrintfA(Buffer + 1, BufferSize - 1, "%u", Permission->Domain);
 
 fail1:
     Error("fail1 (%08x)\n", status);
