@@ -935,6 +935,120 @@ EvtchnInterruptCallback(
     return DoneSomething;
 }
 
+VOID
+EvtchnReset(
+    VOID
+    )
+{
+    ULONGLONG                   Value;
+    XENBUS_EVTCHN_CHANNEL       Store;
+    XENBUS_EVTCHN_CHANNEL       Console;
+    NTSTATUS                    status;
+
+    //
+    // When we reset the event channel ABI we will lose our
+    // binding to the any event channel which was set up
+    // by the toolstack during domain build.
+    // We need to get the binding back, so we must query the
+    // remote domain and port, and then re-bind after the
+    // reset.
+    //
+
+    RtlZeroMemory(&Store, sizeof (Store));
+    RtlZeroMemory(&Console, sizeof (Console));
+
+    status = HvmGetParam(HVM_PARAM_STORE_EVTCHN, &Value);
+    if (NT_SUCCESS(status))
+        Store.LocalPort = (ULONG)Value;
+
+    status = HvmGetParam(HVM_PARAM_CONSOLE_EVTCHN, &Value);
+    if (NT_SUCCESS(status))
+        Console.LocalPort = (ULONG)Value;
+
+    if (Store.LocalPort != 0) {
+        domid_t         RemoteDomain;
+        evtchn_port_t   RemotePort;
+
+        status = EventChannelQueryInterDomain(Store.LocalPort,
+                                              &RemoteDomain,
+                                              &RemotePort);
+        ASSERT(NT_SUCCESS(status));
+
+        Store.Parameters.InterDomain.RemoteDomain = RemoteDomain;
+        Store.Parameters.InterDomain.RemotePort = RemotePort;
+
+        LogPrintf(LOG_LEVEL_INFO, "EVTCHN_RESET: STORE (%u) -> (%u:%u)\n",
+                  Store.LocalPort,
+                  RemoteDomain,
+                  RemotePort);
+    }
+
+    if (Console.LocalPort != 0) {
+        domid_t         RemoteDomain;
+        evtchn_port_t   RemotePort;
+
+        status = EventChannelQueryInterDomain(Console.LocalPort,
+                                              &RemoteDomain,
+                                              &RemotePort);
+        ASSERT(NT_SUCCESS(status));
+
+        Console.Parameters.InterDomain.RemoteDomain = RemoteDomain;
+        Console.Parameters.InterDomain.RemotePort = RemotePort;
+
+        LogPrintf(LOG_LEVEL_INFO, "EVTCHN_RESET: CONSOLE (%u) -> (%u:%u)\n",
+                  Console.LocalPort,
+                  RemoteDomain,
+                  RemotePort);
+    }
+
+    (VOID) EventChannelReset();
+    LogPrintf(LOG_LEVEL_INFO, "EVTCHN_RESET: RESET\n");
+
+    if (Store.LocalPort != 0) {
+        domid_t         RemoteDomain;
+        evtchn_port_t   RemotePort;
+
+        RemoteDomain = Store.Parameters.InterDomain.RemoteDomain;
+        RemotePort = Store.Parameters.InterDomain.RemotePort;
+
+        status = EventChannelBindInterDomain(RemoteDomain,
+                                             RemotePort,
+                                             &Store.LocalPort);
+        ASSERT(NT_SUCCESS(status));
+
+        status = HvmSetParam(HVM_PARAM_STORE_EVTCHN, Store.LocalPort);
+        ASSERT(NT_SUCCESS(status));
+
+        LogPrintf(LOG_LEVEL_INFO, "EVTCHN_RESET: STORE (%u:%u) -> %u\n",
+                  RemoteDomain,
+                  RemotePort,
+                  Store.LocalPort);
+    }
+
+    if (Console.LocalPort != 0) {
+        domid_t         RemoteDomain;
+        evtchn_port_t   RemotePort;
+
+        RemoteDomain = Console.Parameters.InterDomain.RemoteDomain;
+        RemotePort = Console.Parameters.InterDomain.RemotePort;
+
+        status = EventChannelBindInterDomain(RemoteDomain,
+                                             RemotePort,
+                                             &Console.LocalPort);
+        ASSERT(NT_SUCCESS(status));
+
+        status = HvmSetParam(HVM_PARAM_CONSOLE_EVTCHN, Console.LocalPort);
+        ASSERT(NT_SUCCESS(status));
+
+        LogPrintf(LOG_LEVEL_INFO, "EVTCHN_RESET: CONSOLE (%u:%u) -> %u\n",
+                  RemoteDomain,
+                  RemotePort,
+                  Console.LocalPort);
+    }
+}
+
+
+
 static NTSTATUS
 EvtchnAbiAcquire(
     IN  PXENBUS_EVTCHN_CONTEXT  Context
@@ -1000,6 +1114,7 @@ EvtchnInterruptEnable(
         PXENBUS_EVTCHN_PROCESSOR    Processor;
         unsigned int                vcpu_id;
         UCHAR                       Vector;
+        PROCESSOR_NUMBER            ProcNumber;
 
         Processor = &Context->Processor[Index];
 
@@ -1010,21 +1125,30 @@ EvtchnInterruptEnable(
         Vector = FdoGetInterruptVector(Context->Fdo, Processor->Interrupt);
 
         status = HvmSetEvtchnUpcallVector(vcpu_id, Vector);
-        if (NT_SUCCESS(status)) {
-            PROCESSOR_NUMBER    ProcNumber;
+        if (!NT_SUCCESS(status)) {
+            if (status != STATUS_NOT_IMPLEMENTED )
+                continue;
 
-            status = KeGetProcessorNumberFromIndex(Index, &ProcNumber);
-            ASSERT(NT_SUCCESS(status));
-
-            Info("CPU %u:%u\n", ProcNumber.Group, ProcNumber.Number);
-            Processor->UpcallEnabled = TRUE;
+            Info("PER-CPU UPCALL NOT IMPLEMENTED\n");
+            break;
         }
+
+        status = KeGetProcessorNumberFromIndex(Index, &ProcNumber);
+        ASSERT(NT_SUCCESS(status));
+
+        Info("CPU %u:%u (Vector = %u)\n",
+             ProcNumber.Group,
+             ProcNumber.Number,
+             Vector);
+        Processor->UpcallEnabled = TRUE;
     }
 
     Line = FdoGetInterruptLine(Context->Fdo, Context->Interrupt);
 
     status = HvmSetParam(HVM_PARAM_CALLBACK_IRQ, Line);
     ASSERT(NT_SUCCESS(status));
+
+    Info("CALLBACK VIA (Vector = %u)\n", Line);
 
     Trace("<====\n");
 }
