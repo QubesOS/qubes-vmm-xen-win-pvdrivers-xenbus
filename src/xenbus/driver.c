@@ -503,8 +503,6 @@ DriverEntry(
     ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
     WdmlibProcgrpInitialize();
 
-    __DbgPrintEnable();
-
     Trace("====>\n");
 
     __DriverSetDriverObject(DriverObject);

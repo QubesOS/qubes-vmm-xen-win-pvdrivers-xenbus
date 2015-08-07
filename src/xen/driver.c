@@ -129,8 +129,6 @@ DllInitialize(
     ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
     WdmlibProcgrpInitialize();
 
-    __DbgPrintEnable();
-
     Trace("====>\n");
 
     if (*InitSafeBootMode > 0)
