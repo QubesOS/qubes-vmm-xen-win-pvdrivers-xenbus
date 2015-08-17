@@ -42,21 +42,6 @@ DriverGetParametersKey(
     VOID
     );
 
-extern HANDLE
-DriverGetUnplugKey(
-    VOID
-    );
-
-extern PCHAR
-DriverGetActiveDeviceID(
-    VOID
-    );
-
-extern PCHAR
-DriverGetActiveInstanceID(
-    VOID
-    );
-
 extern VOID
 DriverAcquireMutex(
     VOID
@@ -90,10 +75,10 @@ DriverGetEmulatedContext(
     VOID
     );
 
-#include "unplug.h"
+#include "pvdevice.h"
 
-PXENFILT_UNPLUG_CONTEXT
-DriverGetUnplugContext(
+PXENFILT_PVDEVICE_CONTEXT
+DriverGetPvdeviceContext(
     VOID
     );
 
@@ -128,8 +113,8 @@ typedef struct _XENFILT_DX {
     SYSTEM_POWER_STATE  SystemPowerState;
     DEVICE_POWER_STATE  DevicePowerState;
 
-    WCHAR               DeviceID[MAX_DEVICE_ID_LEN];
-    WCHAR               InstanceID[MAX_DEVICE_ID_LEN];
+    CHAR                DeviceID[MAX_DEVICE_ID_LEN];
+    CHAR                InstanceID[MAX_DEVICE_ID_LEN];
 
     IO_REMOVE_LOCK      RemoveLock;
 

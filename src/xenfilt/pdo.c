@@ -37,6 +37,7 @@
 #include <stdlib.h>
 
 #include "emulated.h"
+#include "pvdevice.h"
 #include "names.h"
 #include "fdo.h"
 #include "pdo.h"
@@ -67,6 +68,8 @@ struct _XENFILT_PDO {
 
     XENFILT_EMULATED_OBJECT_TYPE    Type;
     PXENFILT_EMULATED_OBJECT        EmulatedObject;
+
+    XENFILT_PVDEVICE_INTERFACE      PvdeviceInterface;
 };
 
 static FORCEINLINE PVOID
@@ -250,23 +253,64 @@ __PdoGetFdo(
     return Pdo->Fdo;
 }
 
-static FORCEINLINE VOID
-__PdoSetDeviceID(
+static NTSTATUS
+PdoSetDeviceInstance(
     IN  PXENFILT_PDO    Pdo,
-    IN  PWCHAR          DeviceID
+    IN  PCHAR           DeviceID,
+    IN  PCHAR           InstanceID
     )
 {
     PXENFILT_DX         Dx = Pdo->Dx;
+    CHAR                ActiveDeviceID[MAX_DEVICE_ID_LEN];
+    CHAR                ActiveInstanceID[MAX_DEVICE_ID_LEN];
     NTSTATUS            status;
 
-    status = RtlStringCbPrintfW(Dx->DeviceID,
+    status = XENFILT_PVDEVICE(Acquire, &Pdo->PvdeviceInterface);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    status = XENFILT_PVDEVICE(GetActive,
+                              &Pdo->PvdeviceInterface,
+                              ActiveDeviceID,
+                              ActiveInstanceID);
+    if (!NT_SUCCESS(status))
+        goto done;
+
+    if (_stricmp(DeviceID, ActiveDeviceID) != 0)
+        goto done;
+
+    if (_stricmp(InstanceID, ActiveInstanceID) != 0) {
+        Warning("(%s) '%s' -> '%s'\n",
+                Dx->DeviceID,
+                InstanceID,
+                ActiveInstanceID);
+        InstanceID = ActiveInstanceID;
+    }
+
+done:
+    XENFILT_PVDEVICE(Release, &Pdo->PvdeviceInterface);
+
+    status = RtlStringCbPrintfA(Dx->DeviceID,
                                 MAX_DEVICE_ID_LEN,
-                                L"%ws",
+                                "%s",
                                 DeviceID);
     ASSERT(NT_SUCCESS(status));
+
+    status = RtlStringCbPrintfA(Dx->InstanceID,
+                                MAX_DEVICE_ID_LEN,
+                                "%s",
+                                InstanceID);
+    ASSERT(NT_SUCCESS(status));
+
+    return STATUS_SUCCESS;
+
+fail1:
+    Error("fail1 (%08x)\n", status);
+
+    return status;
 }
 
-static FORCEINLINE PWCHAR
+static FORCEINLINE PCHAR
 __PdoGetDeviceID(
     IN  PXENFILT_PDO    Pdo
     )
@@ -276,48 +320,7 @@ __PdoGetDeviceID(
     return Dx->DeviceID;
 }
 
-static FORCEINLINE VOID
-__PdoSetInstanceID(
-    IN  PXENFILT_PDO    Pdo,
-    IN  PWCHAR          InstanceID
-    )
-{
-    WCHAR               ActiveDeviceID[MAX_DEVICE_ID_LEN];
-    WCHAR               ActiveInstanceID[MAX_DEVICE_ID_LEN];
-    PXENFILT_DX         Dx = Pdo->Dx;
-    NTSTATUS            status;
-
-    RtlStringCbPrintfW(ActiveDeviceID,
-                       sizeof (ActiveDeviceID),
-                       L"%hs",
-                       DriverGetActiveDeviceID());
-    
-    RtlStringCbPrintfW(ActiveInstanceID,
-                       sizeof (ActiveInstanceID),
-                       L"%hs",
-                       DriverGetActiveInstanceID());
-
-    if (_wcsicmp(Dx->DeviceID, ActiveDeviceID) != 0)
-        goto done;
-
-    if (_wcsicmp(InstanceID, ActiveInstanceID) != 0) {
-        Warning("(%ws) '%ws' -> '%ws'\n",
-                Dx->DeviceID,
-                InstanceID,
-                ActiveInstanceID);
-
-        InstanceID = ActiveInstanceID;
-    }
-
-done:
-    status = RtlStringCbPrintfW(Dx->InstanceID,
-                                MAX_DEVICE_ID_LEN,
-                                L"%ws",
-                                InstanceID);
-    ASSERT(NT_SUCCESS(status));
-}
-
-static FORCEINLINE PWCHAR
+static FORCEINLINE PCHAR
 __PdoGetInstanceID(
     IN  PXENFILT_PDO    Pdo
     )
@@ -337,7 +340,7 @@ __PdoSetName(
 
     status = RtlStringCbPrintfA(Pdo->Name,
                                 MAXNAMELEN,
-                                "%ws\\%ws",
+                                "%s\\%s",
                                 Dx->DeviceID,
                                 Dx->InstanceID);
     ASSERT(NT_SUCCESS(status));
@@ -800,6 +803,7 @@ PdoRemoveDevice(
 {
     PXENFILT_FDO        Fdo = __PdoGetFdo(Pdo);
     POWER_STATE         PowerState;
+    BOOLEAN             NeedInvalidate;
     NTSTATUS            status;
 
     status = IoAcquireRemoveLock(&Pdo->Dx->RemoveLock, Irp);
@@ -817,22 +821,34 @@ PdoRemoveDevice(
     __PdoSetDevicePowerState(Pdo, PowerDeviceD3);
 
 done:
+    status = PdoForwardIrpSynchronously(Pdo, Irp);
+
+    FdoAcquireMutex(Fdo);
+
+    NeedInvalidate = FALSE;
+
     if (__PdoIsMissing(Pdo)) {
+        DEVICE_PNP_STATE    State = __PdoGetDevicePnpState(Pdo);
+
         __PdoSetDevicePnpState(Pdo, Deleted);
         IoReleaseRemoveLockAndWait(&Pdo->Dx->RemoveLock, Irp);
+
+        if (State == SurpriseRemovePending)
+            PdoDestroy(Pdo);
+        else
+            NeedInvalidate = TRUE;
     } else {
         __PdoSetDevicePnpState(Pdo, Enumerated);
         IoReleaseRemoveLock(&Pdo->Dx->RemoveLock, Irp);
     }
 
-    status = PdoForwardIrpSynchronously(Pdo, Irp);
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    FdoReleaseMutex(Fdo);
 
-    if (__PdoIsMissing(Pdo)) {
-        FdoAcquireMutex(Fdo);
-        PdoDestroy(Pdo);
-        FdoReleaseMutex(Fdo);
-    }
+    if (NeedInvalidate)
+        IoInvalidateDeviceRelations(FdoGetPhysicalDeviceObject(Fdo),
+                                    BusRelations);
+
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
 
     return status;
 
@@ -904,7 +920,7 @@ done:                                                               \
 }                                                                   \
 
 DEFINE_PDO_QUERY_INTERFACE(Emulated)
-DEFINE_PDO_QUERY_INTERFACE(Unplug)
+DEFINE_PDO_QUERY_INTERFACE(Pvdevice)
 
 struct _INTERFACE_ENTRY {
     const GUID  *Guid;
@@ -917,7 +933,7 @@ struct _INTERFACE_ENTRY {
 
 struct _INTERFACE_ENTRY PdoInterfaceTable[] = {
     DEFINE_INTERFACE_ENTRY(EMULATED_INTERFACE, Emulated),
-    DEFINE_INTERFACE_ENTRY(UNPLUG_INTERFACE, Unplug),
+    DEFINE_INTERFACE_ENTRY(PVDEVICE_INTERFACE, Pvdevice),
     { NULL, NULL, NULL }
 };
 
@@ -1026,7 +1042,7 @@ PdoQueryId(
     case BusQueryInstanceID:
         status = RtlStringCbPrintfW(Buffer,
                                     Id.MaximumLength,
-                                    L"%s",
+                                    L"%hs",
                                     __PdoGetInstanceID(Pdo));
         ASSERT(NT_SUCCESS(status));
 
@@ -1036,7 +1052,7 @@ PdoQueryId(
     case BusQueryDeviceID:
         status = RtlStringCbPrintfW(Buffer,
                                     Id.MaximumLength,
-                                    L"%s",
+                                    L"%hs",
                                     __PdoGetDeviceID(Pdo));
         ASSERT(NT_SUCCESS(status));
 
@@ -1086,8 +1102,10 @@ PdoEject(
     PXENFILT_FDO        Fdo = __PdoGetFdo(Pdo);
     NTSTATUS            status;
 
+    FdoAcquireMutex(Fdo);
     __PdoSetMissing(Pdo, "Ejected");
     __PdoSetDevicePnpState(Pdo, Deleted);
+    FdoReleaseMutex(Fdo);
 
     status = PdoForwardIrpSynchronously(Pdo, Irp);
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -1924,8 +1942,8 @@ NTSTATUS
 PdoCreate(
     PXENFILT_FDO                    Fdo,
     PDEVICE_OBJECT                  PhysicalDeviceObject,
-    PWCHAR                          DeviceID,
-    PWCHAR                          InstanceID,
+    PCHAR                           DeviceID,
+    PCHAR                           InstanceID,
     XENFILT_EMULATED_OBJECT_TYPE    Type
     )
 {
@@ -1997,8 +2015,16 @@ PdoCreate(
     if (!NT_SUCCESS(status))
         goto fail6;
 
-    __PdoSetDeviceID(Pdo, DeviceID);
-    __PdoSetInstanceID(Pdo, InstanceID);
+    status = PvdeviceGetInterface(DriverGetPvdeviceContext(),
+                                  XENFILT_PVDEVICE_INTERFACE_VERSION_MAX,
+                                  (PINTERFACE)&Pdo->PvdeviceInterface,
+                                  sizeof (Pdo->PvdeviceInterface));
+    ASSERT(NT_SUCCESS(status));
+
+    status = PdoSetDeviceInstance(Pdo, DeviceID, InstanceID);
+    if (!NT_SUCCESS(status))
+        goto fail7;
+
     __PdoSetName(Pdo);
 
     Info("%p (%s)\n",
@@ -2017,6 +2043,12 @@ PdoCreate(
     FdoAddPhysicalDeviceObject(Fdo, Pdo);
 
     return STATUS_SUCCESS;
+
+fail7:
+    Error("fail7\n");
+
+    RtlZeroMemory(&Pdo->PvdeviceInterface,
+                  sizeof (XENFILT_PVDEVICE_INTERFACE));
 
 fail6:
     Error("fail6\n");
@@ -2086,6 +2118,9 @@ PdoDestroy(
     Pdo->Reason = NULL;
 
     RtlZeroMemory(Pdo->Name, sizeof (Pdo->Name));
+
+    RtlZeroMemory(&Pdo->PvdeviceInterface,
+                  sizeof (XENFILT_PVDEVICE_INTERFACE));
 
     EmulatedRemoveObject(DriverGetEmulatedContext(),
                          Pdo->EmulatedObject);

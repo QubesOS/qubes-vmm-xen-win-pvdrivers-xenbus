@@ -36,7 +36,6 @@
 #include <ntstrsafe.h>
 
 #include <emulated_interface.h>
-#include <unplug_interface.h>
 
 #include "names.h"
 #include "fdo.h"
@@ -48,6 +47,8 @@
 #include "dbg_print.h"
 #include "assert.h"
 #include "util.h"
+#include "version.h"
+#include "revision.h"
 
 #define PDO_TAG 'ODP'
 
@@ -67,9 +68,6 @@ struct _XENBUS_PDO {
 
     BOOLEAN                     Removable;
     BOOLEAN                     Ejectable;
-
-    PULONG                      Revision;
-    ULONG                       Count;
 
     BUS_INTERFACE_STANDARD      BusInterface;
 
@@ -354,155 +352,116 @@ PdoGetFdo(
     return __PdoGetFdo(Pdo);
 }
 
-static NTSTATUS
-PdoAddRevision(
-    IN  PXENBUS_PDO Pdo,
-    IN  ULONG       Revision
-    )
-{
-    PVOID           Buffer;
-    ULONG           Count;
-    NTSTATUS        status;
+typedef struct _XENBUS_PDO_REVISION {
+    ULONG   Number;
+    ULONG   SuspendInterfaceVersion;
+    ULONG   SharedInfoInterfaceVersion;
+    ULONG   EvtchnInterfaceVersion;
+    ULONG   DebugInterfaceVersion;
+    ULONG   StoreInterfaceVersion;
+    ULONG   RangeSetInterfaceVersion;
+    ULONG   CacheInterfaceVersion;
+    ULONG   GnttabInterfaceVersion;
+    ULONG   UnplugInterfaceVersion;
+    ULONG   EmulatedInterfaceVersion;
+} XENBUS_PDO_REVISION, *PXENBUS_PDO_REVISION;
 
-    Count = Pdo->Count + 1;
+#define DEFINE_REVISION(_N, _S, _SI, _E, _D, _ST, _R, _C, _G, _U, _EM) \
+    { (_N), (_S), (_SI), (_E), (_D), (_ST), (_R), (_C), (_G), (_U), (_EM) }
 
-    Buffer = __PdoAllocate(sizeof (ULONG) * Count);
+static XENBUS_PDO_REVISION PdoRevision[] = {
+    DEFINE_REVISION_TABLE
+};
 
-    status = STATUS_NO_MEMORY;
-    if (Buffer == NULL)
-        goto fail1;
+#undef DEFINE_REVISION
 
-    if (Pdo->Revision != NULL) {
-        RtlCopyMemory(Buffer,
-                      Pdo->Revision,
-                      sizeof (ULONG) * Pdo->Count);
-        __PdoFree(Pdo->Revision);
-    }
-
-    Pdo->Revision = Buffer;
-    Pdo->Revision[Pdo->Count] = Revision;
-
-    Pdo->Count++;
-    ASSERT3U(Pdo->Count, <=, 64);
-
-    return STATUS_SUCCESS;
-
-fail1:
-    Error("fail1 (%08x)\n", status);
-
-    return status;
-}
-
-static NTSTATUS
-PdoSetRevisions(
+static VOID
+PdoDumpRevisions(
     IN  PXENBUS_PDO Pdo
     )
 {
-    ULONG           Suspend;
-    ULONG           Revision;
-    NTSTATUS        status;
+    ULONG           Index;
 
-    Revision = 0;
+    UNREFERENCED_PARAMETER(Pdo);
 
-    // Enumerate all possible combinations of exported interface versions since v1
-    // and add a PDO revsion for each combination that's currently supported. Note that
-    // the exported interfaces include any interface queries we pass through.
-    // We must enumerate from v1 to ensure that revision numbers don't change
-    // even when a particular combination of interface versions becomes
-    // unsupported. (See README.md for API versioning policy).
+    for (Index = 0; Index < ARRAYSIZE(PdoRevision); Index++) {
+        PXENBUS_PDO_REVISION Revision = &PdoRevision[Index];
 
-    for (Suspend = 1; Suspend <= XENBUS_SUSPEND_INTERFACE_VERSION_MAX; Suspend++) {
-        ULONG   SharedInfo;
-        
-        for (SharedInfo = 1; SharedInfo <= XENBUS_SHARED_INFO_INTERFACE_VERSION_MAX; SharedInfo++) {
-            ULONG   Evtchn;
-            
-            for (Evtchn = 1; Evtchn <= XENBUS_EVTCHN_INTERFACE_VERSION_MAX; Evtchn++) {
-                ULONG   Debug;
+        ASSERT3U(Revision->SuspendInterfaceVersion, >=, XENBUS_SUSPEND_INTERFACE_VERSION_MIN);
+        ASSERT3U(Revision->SuspendInterfaceVersion, <=, XENBUS_SUSPEND_INTERFACE_VERSION_MAX);
+        ASSERT(IMPLY(Index == ARRAYSIZE(PdoRevision) - 1,
+                     Revision->SuspendInterfaceVersion == XENBUS_SUSPEND_INTERFACE_VERSION_MAX));
 
-                for (Debug = 1; Debug <= XENBUS_DEBUG_INTERFACE_VERSION_MAX; Debug++) {
-                    ULONG   Store;
+        ASSERT3U(Revision->SharedInfoInterfaceVersion, >=, XENBUS_SHARED_INFO_INTERFACE_VERSION_MIN);
+        ASSERT3U(Revision->SharedInfoInterfaceVersion, <=, XENBUS_SHARED_INFO_INTERFACE_VERSION_MAX);
+        ASSERT(IMPLY(Index == ARRAYSIZE(PdoRevision) - 1,
+                     Revision->SharedInfoInterfaceVersion == XENBUS_SHARED_INFO_INTERFACE_VERSION_MAX));
 
-                    for (Store = 1; Store <= XENBUS_STORE_INTERFACE_VERSION_MAX; Store++) {
-                        ULONG   RangeSet;
+        ASSERT3U(Revision->EvtchnInterfaceVersion, >=, XENBUS_EVTCHN_INTERFACE_VERSION_MIN);
+        ASSERT3U(Revision->EvtchnInterfaceVersion, <=, XENBUS_EVTCHN_INTERFACE_VERSION_MAX);
+        ASSERT(IMPLY(Index == ARRAYSIZE(PdoRevision) - 1,
+                     Revision->EvtchnInterfaceVersion == XENBUS_EVTCHN_INTERFACE_VERSION_MAX));
 
-                        for (RangeSet = 1; RangeSet <= XENBUS_RANGE_SET_INTERFACE_VERSION_MAX; RangeSet++) {
-                            ULONG   Cache;
-                            
-                            for (Cache = 1; Cache <= XENBUS_CACHE_INTERFACE_VERSION_MAX; Cache++) {
-                                ULONG   Gnttab;
-                            
-                                for (Gnttab = 1; Gnttab <= XENBUS_GNTTAB_INTERFACE_VERSION_MAX; Gnttab++) {
-                                    ULONG   Emulated;
-                                
-                                    for (Emulated = 1; Emulated <= XENFILT_EMULATED_INTERFACE_VERSION_MAX; Emulated++) {
-                                        ULONG   Unplug;
+        ASSERT3U(Revision->DebugInterfaceVersion, >=, XENBUS_DEBUG_INTERFACE_VERSION_MIN);
+        ASSERT3U(Revision->DebugInterfaceVersion, <=, XENBUS_DEBUG_INTERFACE_VERSION_MAX);
+        ASSERT(IMPLY(Index == ARRAYSIZE(PdoRevision) - 1,
+                     Revision->DebugInterfaceVersion == XENBUS_DEBUG_INTERFACE_VERSION_MAX));
 
-                                        for (Unplug = 1; Unplug <= XENFILT_UNPLUG_INTERFACE_VERSION_MAX; Unplug++) {
-                                            Revision++;
+        ASSERT3U(Revision->StoreInterfaceVersion, >=, XENBUS_STORE_INTERFACE_VERSION_MIN);
+        ASSERT3U(Revision->StoreInterfaceVersion, <=, XENBUS_STORE_INTERFACE_VERSION_MAX);
+        ASSERT(IMPLY(Index == ARRAYSIZE(PdoRevision) - 1,
+                     Revision->StoreInterfaceVersion == XENBUS_STORE_INTERFACE_VERSION_MAX));
 
-                                            if (Suspend >= XENBUS_SUSPEND_INTERFACE_VERSION_MIN &&
-                                                SharedInfo >= XENBUS_SHARED_INFO_INTERFACE_VERSION_MIN &&
-                                                Evtchn >= XENBUS_EVTCHN_INTERFACE_VERSION_MIN &&
-                                                Debug >= XENBUS_DEBUG_INTERFACE_VERSION_MIN &&
-                                                Store >= XENBUS_STORE_INTERFACE_VERSION_MIN &&
-                                                RangeSet >= XENBUS_RANGE_SET_INTERFACE_VERSION_MIN &&
-                                                Cache >= XENBUS_CACHE_INTERFACE_VERSION_MIN &&
-                                                Gnttab >= XENBUS_GNTTAB_INTERFACE_VERSION_MIN &&
-                                                Emulated >= XENFILT_EMULATED_INTERFACE_VERSION_MIN &&
-                                                Unplug >= XENFILT_UNPLUG_INTERFACE_VERSION_MIN) {
-                                                Info("%08X -> "
-                                                     "SUSPEND v%u "
-                                                     "SHARED_INFO v%u "
-                                                     "EVTCHN v%u "
-                                                     "DEBUG v%u "
-                                                     "STORE v%u "
-                                                     "RANGE_SET v%u "
-                                                     "CACHE v%u "
-                                                     "GNTTAB v%u "
-                                                     "EMULATED v%u\n",
-                                                     "UNPLUG v%u\n",
-                                                     Revision,
-                                                     Suspend,
-                                                     SharedInfo,
-                                                     Evtchn,
-                                                     Debug,
-                                                     Store,
-                                                     RangeSet,
-                                                     Cache,
-                                                     Gnttab,
-                                                     Emulated,
-                                                     Unplug);
+        ASSERT3U(Revision->RangeSetInterfaceVersion, >=, XENBUS_RANGE_SET_INTERFACE_VERSION_MIN);
+        ASSERT3U(Revision->RangeSetInterfaceVersion, <=, XENBUS_RANGE_SET_INTERFACE_VERSION_MAX);
+        ASSERT(IMPLY(Index == ARRAYSIZE(PdoRevision) - 1,
+                     Revision->RangeSetInterfaceVersion == XENBUS_RANGE_SET_INTERFACE_VERSION_MAX));
 
-                                                status = PdoAddRevision(Pdo, Revision);
-                                                if (!NT_SUCCESS(status))
-                                                    goto fail1;
-                                            }   
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }   
-        }
-    }                             
+        ASSERT3U(Revision->CacheInterfaceVersion, >=, XENBUS_CACHE_INTERFACE_VERSION_MIN);
+        ASSERT3U(Revision->CacheInterfaceVersion, <=, XENBUS_CACHE_INTERFACE_VERSION_MAX);
+        ASSERT(IMPLY(Index == ARRAYSIZE(PdoRevision) - 1,
+                     Revision->CacheInterfaceVersion == XENBUS_CACHE_INTERFACE_VERSION_MAX));
 
-    ASSERT(Pdo->Count > 0);
-    return STATUS_SUCCESS;
+        ASSERT3U(Revision->GnttabInterfaceVersion, >=, XENBUS_GNTTAB_INTERFACE_VERSION_MIN);
+        ASSERT3U(Revision->GnttabInterfaceVersion, <=, XENBUS_GNTTAB_INTERFACE_VERSION_MAX);
+        ASSERT(IMPLY(Index == ARRAYSIZE(PdoRevision) - 1,
+                     Revision->GnttabInterfaceVersion == XENBUS_GNTTAB_INTERFACE_VERSION_MAX));
 
-fail1:
-    Error("fail1 (%08x)\n", status);
+        ASSERT3U(Revision->UnplugInterfaceVersion, >=, XENBUS_UNPLUG_INTERFACE_VERSION_MIN);
+        ASSERT3U(Revision->UnplugInterfaceVersion, <=, XENBUS_UNPLUG_INTERFACE_VERSION_MAX);
+        ASSERT(IMPLY(Index == ARRAYSIZE(PdoRevision) - 1,
+                     Revision->UnplugInterfaceVersion == XENBUS_UNPLUG_INTERFACE_VERSION_MAX));
 
-    if (Pdo->Revision != NULL) {
-        __PdoFree(Pdo->Revision);
-        Pdo->Revision = NULL;
+        ASSERT3U(Revision->EmulatedInterfaceVersion, >=, XENFILT_EMULATED_INTERFACE_VERSION_MIN);
+        ASSERT3U(Revision->EmulatedInterfaceVersion, <=, XENFILT_EMULATED_INTERFACE_VERSION_MAX);
+        ASSERT(IMPLY(Index == ARRAYSIZE(PdoRevision) - 1,
+                     Revision->EmulatedInterfaceVersion == XENFILT_EMULATED_INTERFACE_VERSION_MAX));
+
+        ASSERT3U(Revision->Number >> 24, ==, MAJOR_VERSION);
+
+        Info("%08X -> "
+             "SUSPEND v%u "
+             "SHARED_INFO v%u "
+             "EVTCHN v%u "
+             "DEBUG v%u "
+             "STORE v%u "
+             "RANGE_SET v%u "
+             "CACHE v%u "
+             "GNTTAB v%u "
+             "UNPLUG v%u "
+             "EMULATED v%u\n",
+             Revision->Number,
+             Revision->SuspendInterfaceVersion,
+             Revision->SharedInfoInterfaceVersion,
+             Revision->EvtchnInterfaceVersion,
+             Revision->DebugInterfaceVersion,
+             Revision->StoreInterfaceVersion,
+             Revision->RangeSetInterfaceVersion,
+             Revision->CacheInterfaceVersion,
+             Revision->GnttabInterfaceVersion,
+             Revision->UnplugInterfaceVersion,
+             Revision->EmulatedInterfaceVersion);
     }
-
-    Pdo->Count = 0;
-
-    return status;
 }
 
 static FORCEINLINE PDEVICE_OBJECT
@@ -889,6 +848,7 @@ PdoRemoveDevice(
     )
 {
     PXENBUS_FDO     Fdo = __PdoGetFdo(Pdo);
+    BOOLEAN         NeedInvalidate;
     NTSTATUS        status;
 
     if (__PdoGetDevicePowerState(Pdo) != PowerDeviceD0)
@@ -897,23 +857,28 @@ PdoRemoveDevice(
     PdoD0ToD3(Pdo);
 
 done:
+    NeedInvalidate = FALSE;
+
     FdoAcquireMutex(Fdo);
 
-    if (__PdoIsMissing(Pdo) ||
-        __PdoGetDevicePnpState(Pdo) == SurpriseRemovePending)
-        __PdoSetDevicePnpState(Pdo, Deleted);
-    else
-        __PdoSetDevicePnpState(Pdo, Enumerated);
-
     if (__PdoIsMissing(Pdo)) {
-        if (__PdoGetDevicePnpState(Pdo) == Deleted)
+        DEVICE_PNP_STATE    State = __PdoGetDevicePnpState(Pdo);
+
+        __PdoSetDevicePnpState(Pdo, Deleted);
+
+        if (State == SurpriseRemovePending)
             PdoDestroy(Pdo);
         else
-            IoInvalidateDeviceRelations(FdoGetPhysicalDeviceObject(Fdo), 
-                                        BusRelations);
+            NeedInvalidate = TRUE;
+    } else {
+        __PdoSetDevicePnpState(Pdo, Enumerated);
     }
 
     FdoReleaseMutex(Fdo);
+
+    if (NeedInvalidate)
+        IoInvalidateDeviceRelations(FdoGetPhysicalDeviceObject(Fdo),
+                                    BusRelations);
 
     status = STATUS_SUCCESS;
 
@@ -1059,6 +1024,7 @@ DEFINE_PDO_QUERY_INTERFACE(Store)
 DEFINE_PDO_QUERY_INTERFACE(RangeSet)
 DEFINE_PDO_QUERY_INTERFACE(Cache)
 DEFINE_PDO_QUERY_INTERFACE(Gnttab)
+DEFINE_PDO_QUERY_INTERFACE(Unplug)
 
 struct _INTERFACE_ENTRY {
     const GUID  *Guid;
@@ -1076,8 +1042,8 @@ static struct _INTERFACE_ENTRY PdoInterfaceTable[] = {
     { &GUID_XENBUS_RANGE_SET_INTERFACE, "RANGE_SET_INTERFACE", PdoQueryRangeSetInterface },
     { &GUID_XENBUS_CACHE_INTERFACE, "CACHE_INTERFACE", PdoQueryCacheInterface },
     { &GUID_XENBUS_GNTTAB_INTERFACE, "GNTTAB_INTERFACE", PdoQueryGnttabInterface },
+    { &GUID_XENBUS_UNPLUG_INTERFACE, "UNPLUG_INTERFACE", PdoQueryUnplugInterface },
     { &GUID_XENFILT_EMULATED_INTERFACE, "EMULATED_INTERFACE", PdoDelegateIrp },
-    { &GUID_XENFILT_UNPLUG_INTERFACE, "UNPLUG_INTERFACE", PdoDelegateIrp },
     { NULL, NULL, NULL }
 };
 
@@ -1404,12 +1370,12 @@ PdoQueryId(
 
     case BusQueryHardwareIDs:
         Trace("BusQueryHardwareIDs\n");
-        Id.MaximumLength = (USHORT)(MAX_DEVICE_ID_LEN * Pdo->Count) * sizeof (WCHAR);
+        Id.MaximumLength = (USHORT)(MAX_DEVICE_ID_LEN * ARRAYSIZE(PdoRevision)) * sizeof (WCHAR);
         break;
 
     case BusQueryCompatibleIDs:
         Trace("BusQueryCompatibleIDs\n");
-        Id.MaximumLength = (USHORT)(MAX_DEVICE_ID_LEN * Pdo->Count) * sizeof (WCHAR);
+        Id.MaximumLength = (USHORT)(MAX_DEVICE_ID_LEN * ARRAYSIZE(PdoRevision)) * sizeof (WCHAR);
         break;
 
     default:
@@ -1439,17 +1405,19 @@ PdoQueryId(
         break;
 
     case BusQueryDeviceID: {
-        ULONG   Index;
+        ULONG                   Index;
+        PXENBUS_PDO_REVISION    Revision;
 
         Type = REG_SZ;
-        Index = Pdo->Count - 1;
+        Index = ARRAYSIZE(PdoRevision) - 1;
+        Revision = &PdoRevision[Index];
 
         status = RtlStringCbPrintfW(Buffer,
                                     Id.MaximumLength,
                                     L"XENBUS\\VEN_%hs&DEV_%hs&REV_%08X",
                                     __PdoGetVendorName(Pdo),
                                     __PdoGetName(Pdo),
-                                    Pdo->Revision[Index]);
+                                    Revision->Number);
         ASSERT(NT_SUCCESS(status));
 
         Buffer += wcslen(Buffer);
@@ -1464,13 +1432,15 @@ PdoQueryId(
         Type = REG_MULTI_SZ;
         Length = Id.MaximumLength;
 
-        for (Index = 0; Index < Pdo->Count; Index++) {
-            status = RtlStringCbPrintfW(Buffer,
-                                        Length,
-                                        L"XENBUS\\VEN_%hs&DEV_%hs&REV_%08X",
-                                        __PdoGetVendorName(Pdo),
-                                        __PdoGetName(Pdo),
-                                        Pdo->Revision[Index]);
+        for (Index = 0; Index < ARRAYSIZE(PdoRevision); Index++) {
+            PXENBUS_PDO_REVISION Revision = &PdoRevision[Index];
+
+           status = RtlStringCbPrintfW(Buffer,
+                                       Length,
+                                       L"XENBUS\\VEN_%hs&DEV_%hs&REV_%08X",
+                                       __PdoGetVendorName(Pdo),
+                                       __PdoGetName(Pdo),
+                                       Revision->Number);
             ASSERT(NT_SUCCESS(status));
 
             Buffer += wcslen(Buffer);
@@ -1595,9 +1565,10 @@ PdoEject(
     __PdoSetDevicePnpState(Pdo, Deleted);
     __PdoSetMissing(Pdo, "device ejected");
 
-    PdoDestroy(Pdo);
-
     FdoReleaseMutex(Fdo);
+
+    IoInvalidateDeviceRelations(FdoGetPhysicalDeviceObject(Fdo),
+                                BusRelations);
 
     status = STATUS_SUCCESS;
 
@@ -2125,13 +2096,9 @@ PdoCreate(
     __PdoSetRemovable(Pdo);
     __PdoSetEjectable(Pdo);
 
-    status = PdoSetRevisions(Pdo);
-    if (!NT_SUCCESS(status))
-        goto fail5;
-
     status = BusInitialize(Pdo, &Pdo->BusInterface);
     if (!NT_SUCCESS(status))
-        goto fail6;
+        goto fail5;
 
     status = SuspendGetInterface(FdoGetSuspendContext(Fdo),
                                  XENBUS_SUSPEND_INTERFACE_VERSION_MAX,
@@ -2140,10 +2107,11 @@ PdoCreate(
     ASSERT(NT_SUCCESS(status));
     ASSERT(Pdo->SuspendInterface.Interface.Context != NULL);
 
-    Info("%p (%s: Highest Revision = %08X)\n",
+    Info("%p (%s)\n",
          PhysicalDeviceObject,
-         __PdoGetName(Pdo),
-         Pdo->Revision[Pdo->Count - 1]);
+         __PdoGetName(Pdo));
+
+    PdoDumpRevisions(Pdo);
 
     Dx->Pdo = Pdo;
     PhysicalDeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
@@ -2152,16 +2120,10 @@ PdoCreate(
 
     return STATUS_SUCCESS;
 
-fail6:
-    Error("fail6\n");
-
-    __PdoFree(Pdo->Revision);
-    Pdo->Revision = NULL;
-    Pdo->Count = 0;
-
 fail5:
     Error("fail5\n");
 
+    Pdo->Ejectable = FALSE;
     Pdo->Removable = FALSE;
 
     ThreadAlert(Pdo->DevicePowerThread);
@@ -2223,10 +2185,6 @@ PdoDestroy(
                   sizeof (XENBUS_SUSPEND_INTERFACE));
 
     BusTeardown(&Pdo->BusInterface);
-
-    __PdoFree(Pdo->Revision);
-    Pdo->Revision = NULL;
-    Pdo->Count = 0;
 
     Pdo->Ejectable = FALSE;
     Pdo->Removable = FALSE;

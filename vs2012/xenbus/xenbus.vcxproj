@@ -83,6 +83,7 @@
     <ClCompile Include="..\..\src\xenbus\evtchn_2l.c" />
     <ClCompile Include="..\..\src\xenbus\evtchn_fifo.c" />
     <ClCompile Include="..\..\src\xenbus\fdo.c" />
+    <ClCompile Include="..\..\src\xenbus\filters.c" />
     <ClCompile Include="..\..\src\xenbus\gnttab.c" />
     <ClCompile Include="..\..\src\xenbus\pdo.c" />
     <ClCompile Include="..\..\src\xenbus\shared_info.c" />
@@ -94,6 +95,7 @@
     <ClCompile Include="..\..\src\xenbus\balloon.c" />
     <ClCompile Include="..\..\src\xenbus\cache.c" />
     <ClCompile Include="..\..\src\xenbus\hash_table.c" />
+    <ClCompile Include="..\..\src\xenbus\unplug.c" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\..\src\xenbus\xenbus.rc" />

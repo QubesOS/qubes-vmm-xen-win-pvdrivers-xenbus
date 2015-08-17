@@ -42,6 +42,21 @@ DriverGetParametersKey(
     VOID
     );
 
+extern VOID
+DriverRequestReboot(
+    VOID
+    );
+
+extern VOID
+DriverAcquireMutex(
+    VOID
+     );
+
+extern VOID
+DriverReleaseMutex(
+    VOID
+     );
+
 typedef struct _XENBUS_FDO      XENBUS_FDO, *PXENBUS_FDO;
 typedef struct _XENBUS_PDO      XENBUS_PDO, *PXENBUS_PDO;
 
@@ -49,6 +64,16 @@ typedef struct _XENBUS_PDO      XENBUS_PDO, *PXENBUS_PDO;
 #include "fdo.h"
 
 #define MAX_DEVICE_ID_LEN   200
+
+extern VOID
+DriverAddFunctionDeviceObject(
+    IN  PXENBUS_FDO Fdo
+    );
+
+extern VOID
+DriverRemoveFunctionDeviceObject(
+    IN  PXENBUS_FDO Fdo
+    );
 
 #pragma warning(push)
 #pragma warning(disable:4201) // nonstandard extension used : nameless struct/union

@@ -38,7 +38,7 @@
 #include <stdlib.h>
 #include <xen.h>
 
-#include <unplug_interface.h>
+#include <pvdevice_interface.h>
 
 #include "names.h"
 #include "registry.h"
@@ -58,6 +58,7 @@
 #include "balloon.h"
 #include "driver.h"
 #include "range_set.h"
+#include "unplug.h"
 #include "dbg_print.h"
 #include "assert.h"
 #include "util.h"
@@ -93,9 +94,9 @@ struct _XENBUS_FDO {
     PIRP                            DevicePowerIrp;
 
     CHAR                            VendorName[MAXNAMELEN];
-    BOOLEAN                         Active;
 
     MUTEX                           Mutex;
+    LIST_ENTRY                      List;
     ULONG                           References;
 
     PXENBUS_THREAD                  ScanThread;
@@ -114,6 +115,9 @@ struct _XENBUS_FDO {
     PCM_PARTIAL_RESOURCE_LIST       RawResourceList;
     PCM_PARTIAL_RESOURCE_LIST       TranslatedResourceList;
 
+    XENFILT_PVDEVICE_INTERFACE      PvdeviceInterface;
+    BOOLEAN                         Active;
+
     PXENBUS_SUSPEND_CONTEXT         SuspendContext;
     PXENBUS_SHARED_INFO_CONTEXT     SharedInfoContext;
     PXENBUS_EVTCHN_CONTEXT          EvtchnContext;
@@ -122,6 +126,7 @@ struct _XENBUS_FDO {
     PXENBUS_RANGE_SET_CONTEXT       RangeSetContext;
     PXENBUS_CACHE_CONTEXT           CacheContext;
     PXENBUS_GNTTAB_CONTEXT          GnttabContext;
+    PXENBUS_UNPLUG_CONTEXT          UnplugContext;
     PXENBUS_BALLOON_CONTEXT         BalloonContext;
 
     XENBUS_DEBUG_INTERFACE          DebugInterface;
@@ -130,10 +135,9 @@ struct _XENBUS_FDO {
     XENBUS_STORE_INTERFACE          StoreInterface;
     XENBUS_RANGE_SET_INTERFACE      RangeSetInterface;
     XENBUS_BALLOON_INTERFACE        BalloonInterface;
-    XENFILT_UNPLUG_INTERFACE        UnplugInterface;
 
-    PXENBUS_RANGE_SET               RangeSet;
-    LIST_ENTRY                      List;
+    PXENBUS_RANGE_SET               IoRangeSet;
+    LIST_ENTRY                      InterruptList;
 
     PXENBUS_EVTCHN_CHANNEL          Channel;
     PXENBUS_SUSPEND_CALLBACK        SuspendCallbackLate;
@@ -242,6 +246,24 @@ __FdoGetSystemPowerState(
     PXENBUS_DX      Dx = Fdo->Dx;
 
     return Dx->SystemPowerState;
+}
+
+static FORCEINLINE PDEVICE_OBJECT
+__FdoGetDeviceObject(
+    IN  PXENBUS_FDO Fdo
+    )
+{
+    PXENBUS_DX      Dx = Fdo->Dx;
+
+    return Dx->DeviceObject;
+}
+
+PDEVICE_OBJECT
+FdoGetDeviceObject(
+    IN  PXENBUS_FDO Fdo
+    )
+{
+    return __FdoGetDeviceObject(Fdo);
 }
 
 static FORCEINLINE PDEVICE_OBJECT
@@ -442,19 +464,31 @@ FdoGetBusData(
                                     Length);
 }
 
-static FORCEINLINE VOID
+static FORCEINLINE NTSTATUS
 __FdoSetVendorName(
     IN  PXENBUS_FDO Fdo,
+    IN  USHORT      VendorID,
     IN  USHORT      DeviceID
     )
 {
     NTSTATUS        status;
+
+    status = STATUS_NOT_SUPPORTED;
+    if (VendorID != 'XS')
+        goto fail1;
 
     status = RtlStringCbPrintfA(Fdo->VendorName,
                                 MAXNAMELEN,
                                 "XS%04X",
                                 DeviceID);
     ASSERT(NT_SUCCESS(status));
+
+    return STATUS_SUCCESS;
+
+fail1:
+    Error("fail1 (%08x)\n", status);
+
+    return status;
 }
 
 static FORCEINLINE PCHAR
@@ -506,13 +540,161 @@ FdoGetName(
     return __FdoGetName(Fdo);
 }
 
-static FORCEINLINE VOID
-__FdoSetActive(
-    IN  PXENBUS_FDO Fdo,
-    IN  BOOLEAN     Active
+static NTSTATUS
+FdoQueryId(
+    IN  PXENBUS_FDO         Fdo,
+    IN  BUS_QUERY_ID_TYPE   Type,
+    OUT PCHAR               Id
     )
 {
-    Fdo->Active = Active;
+    KEVENT                  Event;
+    IO_STATUS_BLOCK         StatusBlock;
+    PIRP                    Irp;
+    PIO_STACK_LOCATION      StackLocation;
+    NTSTATUS                status;
+
+    ASSERT3U(KeGetCurrentIrql(), ==, PASSIVE_LEVEL);
+
+    KeInitializeEvent(&Event, NotificationEvent, FALSE);
+    RtlZeroMemory(&StatusBlock, sizeof(IO_STATUS_BLOCK));
+
+    Irp = IoBuildSynchronousFsdRequest(IRP_MJ_PNP,
+                                       Fdo->LowerDeviceObject,
+                                       NULL,
+                                       0,
+                                       NULL,
+                                       &Event,
+                                       &StatusBlock);
+
+    status = STATUS_UNSUCCESSFUL;
+    if (Irp == NULL)
+        goto fail1;
+
+    StackLocation = IoGetNextIrpStackLocation(Irp);
+    StackLocation->MinorFunction = IRP_MN_QUERY_ID;
+
+    StackLocation->Parameters.QueryId.IdType = Type;
+
+    Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+
+    status = IoCallDriver(Fdo->LowerDeviceObject, Irp);
+    if (status == STATUS_PENDING) {
+        (VOID) KeWaitForSingleObject(&Event,
+                                     Executive,
+                                     KernelMode,
+                                     FALSE,
+                                     NULL);
+        status = StatusBlock.Status;
+    }
+
+    if (!NT_SUCCESS(status))
+        goto fail2;
+
+    status = RtlStringCbPrintfA(Id,
+                                MAXNAMELEN,
+                                "%ws",
+                                (PWCHAR)StatusBlock.Information);
+    ASSERT(NT_SUCCESS(status));
+
+    ExFreePool((PVOID)StatusBlock.Information);
+
+    return STATUS_SUCCESS;
+
+fail2:
+    Error("fail2\n");
+
+fail1:
+    Error("fail1 (%08x)\n", status);
+
+    return status;
+}
+
+static NTSTATUS
+FdoSetActive(
+    IN  PXENBUS_FDO Fdo
+    )
+{
+    CHAR            DeviceID[MAX_DEVICE_ID_LEN];
+    CHAR            InstanceID[MAX_DEVICE_ID_LEN];
+    CHAR            ActiveDeviceID[MAX_DEVICE_ID_LEN];
+    CHAR            ActiveInstanceID[MAX_DEVICE_ID_LEN];
+    NTSTATUS        status;
+
+    status = FdoQueryId(Fdo,
+                        BusQueryDeviceID,
+                        DeviceID);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    status = FdoQueryId(Fdo,
+                        BusQueryInstanceID,
+                        InstanceID);
+    if (!NT_SUCCESS(status))
+        goto fail2;
+
+    status = XENFILT_PVDEVICE(Acquire, &Fdo->PvdeviceInterface);
+    if (!NT_SUCCESS(status))
+        goto fail3;
+
+    status = XENFILT_PVDEVICE(GetActive,
+                              &Fdo->PvdeviceInterface,
+                              ActiveDeviceID,
+                              ActiveInstanceID);
+    if (NT_SUCCESS(status)) {
+        if (_stricmp(DeviceID, ActiveDeviceID) != 0)
+            goto done;
+    } else {
+        status = XENFILT_PVDEVICE(SetActive,
+                                  &Fdo->PvdeviceInterface,
+                                  DeviceID,
+                                  InstanceID);
+        if (!NT_SUCCESS(status))
+            goto done;
+    }
+
+    Fdo->Active = TRUE;
+
+done:
+    XENFILT_PVDEVICE(Release, &Fdo->PvdeviceInterface);
+
+    return STATUS_SUCCESS;
+
+fail3:
+    Error("fail3\n");
+
+fail2:
+    Error("fail2\n");
+
+fail1:
+    Error("fail1 (%08x)\n", status);
+
+    return status;
+}
+
+static NTSTATUS
+FdoClearActive(
+    IN  PXENBUS_FDO Fdo
+    )
+{
+    NTSTATUS        status;
+
+    status = XENFILT_PVDEVICE(Acquire, &Fdo->PvdeviceInterface);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    (VOID) XENFILT_PVDEVICE(ClearActive,
+                            &Fdo->PvdeviceInterface);
+
+    Fdo->Active = FALSE;
+
+    XENFILT_PVDEVICE(Release, &Fdo->PvdeviceInterface);
+
+    return STATUS_SUCCESS;
+
+fail1:
+    Error("fail1 (%08x)\n", status);
+
+    return status;
 }
 
 static FORCEINLINE BOOLEAN
@@ -521,6 +703,91 @@ __FdoIsActive(
     )
 {
     return Fdo->Active;
+}
+
+static NTSTATUS
+FdoSetFriendlyName(
+    IN  PXENBUS_FDO Fdo,
+    IN  USHORT      DeviceID
+    )
+{
+    HANDLE          SoftwareKey;
+    HANDLE          HardwareKey;
+    PANSI_STRING    DriverDesc;
+    CHAR            Buffer[MAXNAMELEN];
+    ANSI_STRING     FriendlyName[2];
+    NTSTATUS        status;
+
+    status = RegistryOpenSoftwareKey(__FdoGetPhysicalDeviceObject(Fdo),
+                                     KEY_READ,
+                                     &SoftwareKey);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    status = RegistryOpenHardwareKey(__FdoGetPhysicalDeviceObject(Fdo),
+                                     KEY_ALL_ACCESS,
+                                     &HardwareKey);
+    if (!NT_SUCCESS(status))
+        goto fail2;
+
+    status = RegistryQuerySzValue(SoftwareKey,
+                                  "DriverDesc",
+                                  NULL,
+                                  &DriverDesc);
+    if (!NT_SUCCESS(status))
+        goto fail3;
+
+    status = RtlStringCbPrintfA(Buffer,
+                                MAXNAMELEN,
+                                "%Z (%04X)",
+                                &DriverDesc[0],
+                                DeviceID
+                                );
+    if (!NT_SUCCESS(status))
+        goto fail4;
+
+    RtlZeroMemory(FriendlyName, sizeof (ANSI_STRING) * 2);
+    RtlInitAnsiString(&FriendlyName[0], Buffer);
+
+    status = RegistryUpdateSzValue(HardwareKey,
+                                   "FriendlyName",
+                                   REG_SZ,
+                                   FriendlyName);
+    if (!NT_SUCCESS(status))
+        goto fail5;
+
+    Info("%Z\n", &FriendlyName[0]);
+
+    RegistryFreeSzValue(DriverDesc);
+
+    RegistryCloseKey(HardwareKey);
+
+    RegistryCloseKey(SoftwareKey);
+
+    return STATUS_SUCCESS;
+
+fail5:
+    Error("fail5\n");
+
+fail4:
+    Error("fail4\n");
+
+    RegistryFreeSzValue(DriverDesc);
+
+fail3:
+    Error("fail3\n");
+
+    RegistryCloseKey(HardwareKey);
+
+fail2:
+    Error("fail2\n");
+
+    RegistryCloseKey(SoftwareKey);
+
+fail1:
+    Error("fail1 (%08x)\n", status);
+
+    return status;
 }
 
 #define DEFINE_FDO_GET_CONTEXT(_Interface, _Type)               \
@@ -548,6 +815,7 @@ DEFINE_FDO_GET_CONTEXT(Store, PXENBUS_STORE_CONTEXT)
 DEFINE_FDO_GET_CONTEXT(RangeSet, PXENBUS_RANGE_SET_CONTEXT)
 DEFINE_FDO_GET_CONTEXT(Cache, PXENBUS_CACHE_CONTEXT)
 DEFINE_FDO_GET_CONTEXT(Gnttab, PXENBUS_GNTTAB_CONTEXT)
+DEFINE_FDO_GET_CONTEXT(Unplug, PXENBUS_UNPLUG_CONTEXT)
 DEFINE_FDO_GET_CONTEXT(Balloon, PXENBUS_BALLOON_CONTEXT)
 
 __drv_functionClass(IO_COMPLETION_ROUTINE)
@@ -703,7 +971,7 @@ FdoAddPhysicalDeviceObject(
     Dx = (PXENBUS_DX)DeviceObject->DeviceExtension;
     ASSERT3U(Dx->Type, ==, PHYSICAL_DEVICE_OBJECT);
 
-    InsertTailList(&Fdo->Dx->ListEntry, &Dx->ListEntry);
+    InsertTailList(&Fdo->List, &Dx->ListEntry);
     ASSERT3U(Fdo->References, !=, 0);
     Fdo->References++;
 
@@ -766,8 +1034,11 @@ FdoReleaseMutex(
 {
     __FdoReleaseMutex(Fdo);
 
-    if (Fdo->References == 0)
+    if (Fdo->References == 0) {
+        DriverAcquireMutex();
         FdoDestroy(Fdo);
+        DriverReleaseMutex();
+    }
 }
 
 static BOOLEAN
@@ -800,45 +1071,47 @@ FdoEnumerate(
 
     __FdoAcquireMutex(Fdo);
 
-    ListEntry = Fdo->Dx->ListEntry.Flink;
-    while (ListEntry != &Fdo->Dx->ListEntry) {
+    ListEntry = Fdo->List.Flink;
+    while (ListEntry != &Fdo->List) {
         PLIST_ENTRY     Next = ListEntry->Flink;
         PXENBUS_DX      Dx = CONTAINING_RECORD(ListEntry, XENBUS_DX, ListEntry);
-        PCHAR           Name = Dx->Name;
         PXENBUS_PDO     Pdo = Dx->Pdo;
-        BOOLEAN         Missing;
 
-        Name = PdoGetName(Pdo);
-        Missing = TRUE;
+        if (!PdoIsMissing(Pdo) && PdoGetDevicePnpState(Pdo) != Deleted) {
+            PCHAR           Name;
+            BOOLEAN         Missing;
 
-        // If the PDO already exists ans its name is in the class list then
-        // we don't want to remove it.
-        for (Index = 0; Classes[Index].Buffer != NULL; Index++) {
-            PANSI_STRING Class = &Classes[Index];
+            Name = PdoGetName(Pdo);
+            Missing = TRUE;
 
-            if (Class->Length == 0)
-                continue;
+            // If the PDO already exists and its name is in the class list
+            // then we don't want to remove it.
+            for (Index = 0; Classes[Index].Buffer != NULL; Index++) {
+                PANSI_STRING Class = &Classes[Index];
 
-            if (strcmp(Name, Class->Buffer) == 0) {
-                Missing = FALSE;
-                Class->Length = 0;  // avoid duplication
-                break;
+                if (Class->Length == 0)
+                    continue;
+
+                if (strcmp(Name, Class->Buffer) == 0) {
+                    Missing = FALSE;
+                    Class->Length = 0;  // avoid duplication
+                    break;
+                }
             }
-        }
 
-        if (Missing &&
-            !PdoIsMissing(Pdo) &&
-            PdoGetDevicePnpState(Pdo) != Deleted) {
-            PdoSetMissing(Pdo, "device disappeared");
+            if (Missing) {
+                PdoSetMissing(Pdo, "device disappeared");
 
-            // If the PDO has not yet been enumerated then we can go ahead
-            // and mark it as deleted, otherwise we need to notify PnP manager and
-            // wait for the REMOVE_DEVICE IRP.
-            if (PdoGetDevicePnpState(Pdo) == Present) {
-                PdoSetDevicePnpState(Pdo, Deleted);
-                PdoDestroy(Pdo);
-            } else {
-                NeedInvalidate = TRUE;
+                // If the PDO has not yet been enumerated then we can
+                // go ahead and mark it as deleted, otherwise we need
+                // to notify PnP manager and wait for the REMOVE_DEVICE
+                // IRP.
+                if (PdoGetDevicePnpState(Pdo) == Present) {
+                    PdoSetDevicePnpState(Pdo, Deleted);
+                    PdoDestroy(Pdo);
+                } else {
+                    NeedInvalidate = TRUE;
+                }
             }
         }
 
@@ -1094,6 +1367,7 @@ FdoScan(
 
         status = RegistryQuerySzValue(ParametersKey,
                                       "SyntheticClasses",
+                                      NULL,
                                       &SyntheticClasses);
         if (!NT_SUCCESS(status))
             SyntheticClasses = NULL;
@@ -1112,6 +1386,7 @@ FdoScan(
         if (ParametersKey != NULL) {
             status = RegistryQuerySzValue(ParametersKey,
                                           "SupportedClasses",
+                                          NULL,
                                           &SupportedClasses);
             if (!NT_SUCCESS(status))
                 SupportedClasses = NULL;
@@ -1972,7 +2247,7 @@ FdoCreateInterrupt(
     PXENBUS_INTERRUPT   Interrupt;
     NTSTATUS            status;
 
-    InitializeListHead(&Fdo->List);
+    InitializeListHead(&Fdo->InterruptList);
 
     for (Index = 0; Index < Fdo->TranslatedResourceList->Count; Index++) {
         PCM_PARTIAL_RESOURCE_DESCRIPTOR Raw = &Fdo->RawResourceList->PartialDescriptors[Index];
@@ -1985,7 +2260,7 @@ FdoCreateInterrupt(
         if (!NT_SUCCESS(status))
             goto fail1;
 
-        InsertTailList(&Fdo->List, &Interrupt->ListEntry);
+        InsertTailList(&Fdo->InterruptList, &Interrupt->ListEntry);
     }
 
     return STATUS_SUCCESS;
@@ -1993,11 +2268,11 @@ FdoCreateInterrupt(
 fail1:
     Error("fail1 (%08x)\n", status);
 
-    while (!IsListEmpty(&Fdo->List)) {
+    while (!IsListEmpty(&Fdo->InterruptList)) {
         PLIST_ENTRY ListEntry;
 
-        ListEntry = RemoveHeadList(&Fdo->List);
-        ASSERT(ListEntry != &Fdo->List);
+        ListEntry = RemoveHeadList(&Fdo->InterruptList);
+        ASSERT(ListEntry != &Fdo->InterruptList);
 
         RtlZeroMemory(ListEntry, sizeof (LIST_ENTRY));
 
@@ -2006,7 +2281,7 @@ fail1:
         FdoDisconnectInterrupt(Fdo, Interrupt);
     }
 
-    RtlZeroMemory(&Fdo->List, sizeof (LIST_ENTRY));
+    RtlZeroMemory(&Fdo->InterruptList, sizeof (LIST_ENTRY));
 
     return status;
 }
@@ -2025,8 +2300,8 @@ FdoAllocateInterrupt(
     PXENBUS_INTERRUPT       Interrupt;
     KIRQL                   Irql;
 
-    for (ListEntry = Fdo->List.Flink;
-         ListEntry != &Fdo->List;
+    for (ListEntry = Fdo->InterruptList.Flink;
+         ListEntry != &Fdo->InterruptList;
          ListEntry = ListEntry->Flink) {
         Interrupt = CONTAINING_RECORD(ListEntry, XENBUS_INTERRUPT, ListEntry);
 
@@ -2092,12 +2367,12 @@ FdoDestroyInterrupt(
     IN  PXENBUS_FDO     Fdo
     )
 {
-    while (!IsListEmpty(&Fdo->List)) {
+    while (!IsListEmpty(&Fdo->InterruptList)) {
         PLIST_ENTRY         ListEntry;
         PXENBUS_INTERRUPT   Interrupt;
 
-        ListEntry = RemoveHeadList(&Fdo->List);
-        ASSERT(ListEntry != &Fdo->List);
+        ListEntry = RemoveHeadList(&Fdo->InterruptList);
+        ASSERT(ListEntry != &Fdo->InterruptList);
 
         RtlZeroMemory(ListEntry, sizeof (LIST_ENTRY));
 
@@ -2113,7 +2388,7 @@ FdoDestroyInterrupt(
         FdoDisconnectInterrupt(Fdo, Interrupt);
     }
 
-    RtlZeroMemory(&Fdo->List, sizeof (LIST_ENTRY));
+    RtlZeroMemory(&Fdo->InterruptList, sizeof (LIST_ENTRY));
 }
 
 static
@@ -2335,13 +2610,13 @@ found:
     status = XENBUS_RANGE_SET(Create,
                               &Fdo->RangeSetInterface,
                               "io_space",
-                              &Fdo->RangeSet);
+                              &Fdo->IoRangeSet);
     if (!NT_SUCCESS(status))
         goto fail2;
 
     status = XENBUS_RANGE_SET(Put,
                               &Fdo->RangeSetInterface,
-                              Fdo->RangeSet,
+                              Fdo->IoRangeSet,
                               Translated->u.Memory.Start.QuadPart,
                               Translated->u.Memory.Length);
     if (!NT_SUCCESS(status))
@@ -2362,8 +2637,8 @@ fail3:
 
     XENBUS_RANGE_SET(Destroy,
                      &Fdo->RangeSetInterface,
-                     Fdo->RangeSet);
-    Fdo->RangeSet = NULL;
+                     Fdo->IoRangeSet);
+    Fdo->IoRangeSet = NULL;
 
 fail2:
     Error("fail2\n");
@@ -2387,7 +2662,7 @@ FdoAllocateIoSpace(
 
     status = XENBUS_RANGE_SET(Pop,
                               &Fdo->RangeSetInterface,
-                              Fdo->RangeSet,
+                              Fdo->IoRangeSet,
                               Size,
                               &Address->QuadPart);
     if (!NT_SUCCESS(status))
@@ -2417,7 +2692,7 @@ FdoFreeIoSpace(
 
     status = XENBUS_RANGE_SET(Put,
                               &Fdo->RangeSetInterface,
-                              Fdo->RangeSet,
+                              Fdo->IoRangeSet,
                               Address.QuadPart,
                               Size);
     ASSERT(NT_SUCCESS(status));
@@ -2445,15 +2720,15 @@ FdoDestroyIoSpace(
 found:
     status = XENBUS_RANGE_SET(Get,
                               &Fdo->RangeSetInterface,
-                              Fdo->RangeSet,
+                              Fdo->IoRangeSet,
                               Translated->u.Memory.Start.QuadPart,
                               Translated->u.Memory.Length);
     ASSERT(NT_SUCCESS(status));
 
     XENBUS_RANGE_SET(Destroy,
                      &Fdo->RangeSetInterface,
-                     Fdo->RangeSet);
-    Fdo->RangeSet = NULL;
+                     Fdo->IoRangeSet);
+    Fdo->IoRangeSet = NULL;
 }
 
 // This function must not touch pageable code or data
@@ -2508,15 +2783,9 @@ FdoD3ToD0(
             goto fail7;
     }
 
-    if (Fdo->UnplugInterface.Interface.Context != NULL) {
-        status = XENFILT_UNPLUG(Acquire, &Fdo->UnplugInterface);
-        if (!NT_SUCCESS(status))
-            goto fail8;
-    }
-
     status = __FdoD3ToD0(Fdo);
     if (!NT_SUCCESS(status))
-        goto fail9;
+        goto fail8;
 
     status = XENBUS_SUSPEND(Register,
                             &Fdo->SuspendInterface,
@@ -2525,7 +2794,7 @@ FdoD3ToD0(
                             Fdo,
                             &Fdo->SuspendCallbackLate);
     if (!NT_SUCCESS(status))
-        goto fail10;
+        goto fail9;
 
     KeLowerIrql(Irql);
 
@@ -2539,8 +2808,8 @@ not_active:
 
     __FdoAcquireMutex(Fdo);
 
-    for (ListEntry = Fdo->Dx->ListEntry.Flink;
-         ListEntry != &Fdo->Dx->ListEntry;
+    for (ListEntry = Fdo->List.Flink;
+         ListEntry != &Fdo->List;
          ListEntry = ListEntry->Flink) {
         PXENBUS_DX  Dx = CONTAINING_RECORD(ListEntry, XENBUS_DX, ListEntry);
         PXENBUS_PDO Pdo = Dx->Pdo;
@@ -2556,16 +2825,10 @@ not_active:
 
     return STATUS_SUCCESS;
 
-fail10:
-    Error("fail10\n");
-
-    __FdoD0ToD3(Fdo);
-
 fail9:
     Error("fail9\n");
 
-    if (Fdo->UnplugInterface.Interface.Context != NULL)
-        XENFILT_UNPLUG(Release, &Fdo->UnplugInterface);
+    __FdoD0ToD3(Fdo);
 
 fail8:
     Error("fail8\n");
@@ -2628,8 +2891,8 @@ FdoD0ToD3(
 
     __FdoAcquireMutex(Fdo);
 
-    for (ListEntry = Fdo->Dx->ListEntry.Flink;
-         ListEntry != &Fdo->Dx->ListEntry;
+    for (ListEntry = Fdo->List.Flink;
+         ListEntry != &Fdo->List;
          ListEntry = ListEntry->Flink) {
         PXENBUS_DX  Dx = CONTAINING_RECORD(ListEntry, XENBUS_DX, ListEntry);
         PXENBUS_PDO Pdo = Dx->Pdo;
@@ -2692,9 +2955,6 @@ FdoD0ToD3(
 
     __FdoD0ToD3(Fdo);
 
-    if (Fdo->UnplugInterface.Interface.Context != NULL)
-        XENFILT_UNPLUG(Release, &Fdo->UnplugInterface);
-
     if (Fdo->BalloonInterface.Interface.Context != NULL)
         XENBUS_BALLOON(Release, &Fdo->BalloonInterface);
 
@@ -2731,11 +2991,14 @@ FdoS4ToS3(
 
     KeRaiseIrql(DISPATCH_LEVEL, &Irql);
 
+    if (!__FdoIsActive(Fdo))
+        goto not_active;
+
     HypercallPopulate();
 
-    if (Fdo->UnplugInterface.Interface.Context != NULL)
-        XENFILT_UNPLUG(Replay, &Fdo->UnplugInterface);
+    UnplugDevices();
 
+not_active:
     KeLowerIrql(Irql);
 
     __FdoSetSystemPowerState(Fdo, PowerSystemSleeping3);
@@ -3152,8 +3415,8 @@ FdoSurpriseRemoval(
 
     __FdoAcquireMutex(Fdo);
 
-    for (ListEntry = Fdo->Dx->ListEntry.Flink;
-         ListEntry != &Fdo->Dx->ListEntry;
+    for (ListEntry = Fdo->List.Flink;
+         ListEntry != &Fdo->List;
          ListEntry = ListEntry->Flink) {
         PXENBUS_DX  Dx = CONTAINING_RECORD(ListEntry, XENBUS_DX, ListEntry);
         PXENBUS_PDO Pdo = Dx->Pdo;
@@ -3205,8 +3468,8 @@ FdoRemoveDevice(
 
     __FdoAcquireMutex(Fdo);
 
-    ListEntry = Fdo->Dx->ListEntry.Flink;
-    while (ListEntry != &Fdo->Dx->ListEntry) {
+    ListEntry = Fdo->List.Flink;
+    while (ListEntry != &Fdo->List) {
         PLIST_ENTRY Flink = ListEntry->Flink;
         PXENBUS_DX  Dx = CONTAINING_RECORD(ListEntry, XENBUS_DX, ListEntry);
         PXENBUS_PDO Pdo = Dx->Pdo;
@@ -3280,8 +3543,11 @@ done:
     --Fdo->References;
     __FdoReleaseMutex(Fdo);
 
-    if (Fdo->References == 0)
+    if (Fdo->References == 0) {
+        DriverAcquireMutex();
         FdoDestroy(Fdo);
+        DriverReleaseMutex();
+    }
 
     return status;
 }
@@ -3342,12 +3608,12 @@ FdoQueryDeviceRelations(
     __FdoAcquireMutex(Fdo);
 
     Count = 0;
-    for (ListEntry = Fdo->Dx->ListEntry.Flink;
-         ListEntry != &Fdo->Dx->ListEntry;
+    for (ListEntry = Fdo->List.Flink;
+         ListEntry != &Fdo->List;
          ListEntry = ListEntry->Flink)
         Count++;
 
-    Size = FIELD_OFFSET(DEVICE_RELATIONS, Objects) + (sizeof (DEVICE_OBJECT) * __min(Count, 1));
+    Size = FIELD_OFFSET(DEVICE_RELATIONS, Objects) + (sizeof (PDEVICE_OBJECT) * __max(Count, 1));
 
     Relations = __AllocatePoolWithTag(PagedPool, Size, 'SUB');
 
@@ -3355,17 +3621,13 @@ FdoQueryDeviceRelations(
     if (Relations == NULL)
         goto fail1;
 
-    for (ListEntry = Fdo->Dx->ListEntry.Flink;
-         ListEntry != &Fdo->Dx->ListEntry;
+    for (ListEntry = Fdo->List.Flink;
+         ListEntry != &Fdo->List;
          ListEntry = ListEntry->Flink) {
         PXENBUS_DX  Dx = CONTAINING_RECORD(ListEntry, XENBUS_DX, ListEntry);
         PXENBUS_PDO Pdo = Dx->Pdo;
 
         ASSERT3U(Dx->Type, ==, PHYSICAL_DEVICE_OBJECT);
-
-        if (PdoGetDevicePnpState(Pdo) == Deleted &&
-            !PdoIsMissing(Pdo))
-            PdoSetMissing(Pdo, "surprise remove");
 
         if (PdoIsMissing(Pdo))
             continue;
@@ -3394,17 +3656,19 @@ FdoQueryDeviceRelations(
 
     __FdoAcquireMutex(Fdo);
 
-    for (ListEntry = Fdo->Dx->ListEntry.Flink;
-         ListEntry != &Fdo->Dx->ListEntry;
-         ListEntry = ListEntry->Flink) {
+    ListEntry = Fdo->List.Flink;
+    while (ListEntry != &Fdo->List) {
         PXENBUS_DX  Dx = CONTAINING_RECORD(ListEntry, XENBUS_DX, ListEntry);
         PXENBUS_PDO Pdo = Dx->Pdo;
+        PLIST_ENTRY Next = ListEntry->Flink;
 
         ASSERT3U(Dx->Type, ==, PHYSICAL_DEVICE_OBJECT);
 
         if (PdoGetDevicePnpState(Pdo) == Deleted &&
             PdoIsMissing(Pdo))
             PdoDestroy(Pdo);
+
+        ListEntry = Next;
     }
 
     __FdoReleaseMutex(Fdo);
@@ -4471,15 +4735,6 @@ fail1:
                       (_Size),                                                          \
                       (_Optional))
 
-VOID
-FdoGetUnplugInterface(
-    IN  PXENBUS_FDO                 Fdo,
-    OUT PXENFILT_UNPLUG_INTERFACE   UnplugInterface
-    )
-{
-    *UnplugInterface = Fdo->UnplugInterface;
-}
-
 static BOOLEAN
 FdoIsBalloonEnabled(
     IN  PXENBUS_FDO Fdo
@@ -4512,14 +4767,13 @@ done:
 
 NTSTATUS
 FdoCreate(
-    IN  PDEVICE_OBJECT          PhysicalDeviceObject,
-    IN  BOOLEAN                 Active      
+    IN  PDEVICE_OBJECT          PhysicalDeviceObject
     )
 {
     PDEVICE_OBJECT              FunctionDeviceObject;
     PXENBUS_DX                  Dx;
     PXENBUS_FDO                 Fdo;
-    USHORT                      DeviceID;
+    PCI_COMMON_HEADER           Header;
     NTSTATUS                    status;
 
 #pragma prefast(suppress:28197) // Possibly leaking memory 'FunctionDeviceObject'
@@ -4567,65 +4821,80 @@ FdoCreate(
 
     if (FdoGetBusData(Fdo,
                       PCI_WHICHSPACE_CONFIG,
-                      &DeviceID,
-                      FIELD_OFFSET(PCI_COMMON_HEADER, DeviceID),
-                      FIELD_SIZE(PCI_COMMON_HEADER, DeviceID)) == 0)
+                      &Header,
+                      0,
+                      sizeof (PCI_COMMON_HEADER)) == 0)
         goto fail6;
 
-    __FdoSetVendorName(Fdo, DeviceID);
+    status = __FdoSetVendorName(Fdo,
+                                Header.VendorID,
+                                Header.DeviceID);
+    if (!NT_SUCCESS(status))
+        goto fail7;
 
     __FdoSetName(Fdo);
 
-    __FdoSetActive(Fdo, Active);
+    status = FDO_QUERY_INTERFACE(Fdo,
+                                 XENFILT,
+                                 PVDEVICE,
+                                 (PINTERFACE)&Fdo->PvdeviceInterface,
+                                 sizeof (Fdo->PvdeviceInterface),
+                                 TRUE);
+    if (!NT_SUCCESS(status))
+        goto fail8;
+
+    if (Fdo->PvdeviceInterface.Interface.Context == NULL) {
+        DriverRequestReboot();
+        goto done;
+    }
+
+    status = FdoSetActive(Fdo);
+    if (!NT_SUCCESS(status))
+        goto fail9;
 
     if (!__FdoIsActive(Fdo))
         goto done;
 
-    status = FDO_QUERY_INTERFACE(Fdo,
-                                 XENFILT,
-                                 UNPLUG,
-                                 (PINTERFACE)&Fdo->UnplugInterface,
-                                 sizeof (Fdo->UnplugInterface),
-                                 TRUE);
-    if (!NT_SUCCESS(status))
-        goto fail7;
-
     status = DebugInitialize(Fdo, &Fdo->DebugContext);
-    if (!NT_SUCCESS(status))
-        goto fail8;
-
-    status = SuspendInitialize(Fdo, &Fdo->SuspendContext);
-    if (!NT_SUCCESS(status))
-        goto fail9;
-
-    status = SharedInfoInitialize(Fdo, &Fdo->SharedInfoContext);
     if (!NT_SUCCESS(status))
         goto fail10;
 
-    status = EvtchnInitialize(Fdo, &Fdo->EvtchnContext);
+    status = SuspendInitialize(Fdo, &Fdo->SuspendContext);
     if (!NT_SUCCESS(status))
         goto fail11;
 
-    status = StoreInitialize(Fdo, &Fdo->StoreContext);
+    status = SharedInfoInitialize(Fdo, &Fdo->SharedInfoContext);
     if (!NT_SUCCESS(status))
         goto fail12;
 
-    status = RangeSetInitialize(Fdo, &Fdo->RangeSetContext);
+    status = EvtchnInitialize(Fdo, &Fdo->EvtchnContext);
     if (!NT_SUCCESS(status))
         goto fail13;
 
-    status = CacheInitialize(Fdo, &Fdo->CacheContext);
+    status = StoreInitialize(Fdo, &Fdo->StoreContext);
     if (!NT_SUCCESS(status))
         goto fail14;
 
-    status = GnttabInitialize(Fdo, &Fdo->GnttabContext);
+    status = RangeSetInitialize(Fdo, &Fdo->RangeSetContext);
     if (!NT_SUCCESS(status))
         goto fail15;
+
+    status = CacheInitialize(Fdo, &Fdo->CacheContext);
+    if (!NT_SUCCESS(status))
+        goto fail16;
+
+    status = GnttabInitialize(Fdo, &Fdo->GnttabContext);
+    if (!NT_SUCCESS(status))
+        goto fail17;
+
+    status = UnplugInitialize(Fdo, &Fdo->UnplugContext);
+    if (!NT_SUCCESS(status))
+        goto fail18;
 
     if (FdoIsBalloonEnabled(Fdo)) {
         status = BalloonInitialize(Fdo, &Fdo->BalloonContext);
         if (!NT_SUCCESS(status))
-            goto fail16;
+            goto fail19;
     }
 
     status = DebugGetInterface(__FdoGetDebugContext(Fdo),
@@ -4671,8 +4940,10 @@ FdoCreate(
 
 done:
     InitializeMutex(&Fdo->Mutex);
-    InitializeListHead(&Dx->ListEntry);
+    InitializeListHead(&Fdo->List);
     Fdo->References = 1;
+
+    (VOID) FdoSetFriendlyName(Fdo, Header.DeviceID);
 
     Info("%p (%s) %s\n",
          FunctionDeviceObject,
@@ -4682,68 +4953,82 @@ done:
     Dx->Fdo = Fdo;
     FunctionDeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
 
+    DriverAddFunctionDeviceObject(Fdo);
+
     return STATUS_SUCCESS;
 
-fail16:
-    Error("fail16\n");
+fail19:
+    Error("fail19\n");
+
+    UnplugTeardown(Fdo->UnplugContext);
+    Fdo->UnplugContext = NULL;
+
+fail18:
+    Error("fail18\n");
 
     GnttabTeardown(Fdo->GnttabContext);
     Fdo->GnttabContext = NULL;
 
-fail15:
-    Error("fail15\n");
+fail17:
+    Error("fail17\n");
 
     CacheTeardown(Fdo->CacheContext);
     Fdo->CacheContext = NULL;
 
-fail14:
-    Error("fail14\n");
+fail16:
+    Error("fail16\n");
 
     RangeSetTeardown(Fdo->RangeSetContext);
     Fdo->RangeSetContext = NULL;
 
-fail13:
-    Error("fail13\n");
+fail15:
+    Error("fail15\n");
 
     StoreTeardown(Fdo->StoreContext);
     Fdo->StoreContext = NULL;
 
-fail12:
-    Error("fail12\n");
+fail14:
+    Error("fail14\n");
 
     EvtchnTeardown(Fdo->EvtchnContext);
     Fdo->EvtchnContext = NULL;
 
-fail11:
-    Error("fail11\n");
+fail13:
+    Error("fail13\n");
 
     SharedInfoTeardown(Fdo->SharedInfoContext);
     Fdo->SharedInfoContext = NULL;
 
-fail10:
-    Error("fail10\n");
+fail12:
+    Error("fail12\n");
 
     SuspendTeardown(Fdo->SuspendContext);
     Fdo->SuspendContext = NULL;
 
-fail9:
-    Error("fail9\n");
+fail11:
+    Error("fail11\n");
 
     DebugTeardown(Fdo->DebugContext);
     Fdo->DebugContext = NULL;
 
+fail10:
+    Error("fail10\n");
+
+    Fdo->Active = FALSE;
+
+fail9:
+    Error("fail9\n");
+
+    RtlZeroMemory(&Fdo->PvdeviceInterface,
+                  sizeof (XENFILT_PVDEVICE_INTERFACE));
+
 fail8:
     Error("fail8\n");
 
-    RtlZeroMemory(&Fdo->UnplugInterface,
-                  sizeof (XENFILT_UNPLUG_INTERFACE));
+    RtlZeroMemory(Fdo->VendorName, MAXNAMELEN);
 
 fail7:
     Error("fail7\n");
-
-    __FdoSetActive(Fdo, FALSE);
-
-    RtlZeroMemory(Fdo->VendorName, MAXNAMELEN);
 
 fail6:
     Error("fail6\n");
@@ -4796,9 +5081,11 @@ FdoDestroy(
     PXENBUS_DX      Dx = Fdo->Dx;
     PDEVICE_OBJECT  FunctionDeviceObject = Dx->DeviceObject;
 
-    ASSERT(IsListEmpty(&Dx->ListEntry));
+    ASSERT(IsListEmpty(&Fdo->List));
     ASSERT3U(Fdo->References, ==, 0);
     ASSERT3U(__FdoGetDevicePnpState(Fdo), ==, Deleted);
+
+    DriverRemoveFunctionDeviceObject(Fdo);
 
     Fdo->NotDisableable = FALSE;
 
@@ -4808,6 +5095,7 @@ FdoDestroy(
 
     Dx->Fdo = NULL;
 
+    RtlZeroMemory(&Fdo->List, sizeof (LIST_ENTRY));
     RtlZeroMemory(&Fdo->Mutex, sizeof (MUTEX));
 
     if (__FdoIsActive(Fdo)) {
@@ -4834,6 +5122,9 @@ FdoDestroy(
             Fdo->BalloonContext = NULL;
         }
 
+        UnplugTeardown(Fdo->UnplugContext);
+        Fdo->UnplugContext = NULL;
+
         GnttabTeardown(Fdo->GnttabContext);
         Fdo->GnttabContext = NULL;
 
@@ -4858,11 +5149,13 @@ FdoDestroy(
         DebugTeardown(Fdo->DebugContext);
         Fdo->DebugContext = NULL;
 
-        RtlZeroMemory(&Fdo->UnplugInterface,
-                      sizeof (XENFILT_UNPLUG_INTERFACE));
+        Fdo->Active = FALSE;
 
-        __FdoSetActive(Fdo, FALSE);
+        FdoClearActive(Fdo);
     }
+
+    RtlZeroMemory(&Fdo->PvdeviceInterface,
+                  sizeof (XENFILT_PVDEVICE_INTERFACE));
 
     RtlZeroMemory(Fdo->VendorName, MAXNAMELEN);
 
