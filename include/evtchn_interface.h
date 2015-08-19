@@ -227,7 +227,7 @@ DEFINE_GUID(GUID_XENBUS_EVTCHN_INTERFACE,
     \brief EVTCHN interface version 1
     \ingroup interfaces
 */
-/*struct _XENBUS_EVTCHN_INTERFACE_V1 {
+struct _XENBUS_EVTCHN_INTERFACE_V1 {
     INTERFACE               Interface;
     XENBUS_EVTCHN_ACQUIRE   EvtchnAcquire;
     XENBUS_EVTCHN_RELEASE   EvtchnRelease;
@@ -238,12 +238,12 @@ DEFINE_GUID(GUID_XENBUS_EVTCHN_INTERFACE,
     XENBUS_EVTCHN_GET_PORT  EvtchnGetPort;
     XENBUS_EVTCHN_CLOSE     EvtchnClose;
 };
-*/
+
 /*! \struct _XENBUS_EVTCHN_INTERFACE_V2
     \brief EVTCHN interface version 2
     \ingroup interfaces
 */
-/*struct _XENBUS_EVTCHN_INTERFACE_V2 {
+struct _XENBUS_EVTCHN_INTERFACE_V2 {
     INTERFACE               Interface;
     XENBUS_EVTCHN_ACQUIRE   EvtchnAcquire;
     XENBUS_EVTCHN_RELEASE   EvtchnRelease;
@@ -255,7 +255,7 @@ DEFINE_GUID(GUID_XENBUS_EVTCHN_INTERFACE,
     XENBUS_EVTCHN_GET_PORT  EvtchnGetPort;
     XENBUS_EVTCHN_CLOSE     EvtchnClose;
 };
-*/
+
 /*! \struct _XENBUS_EVTCHN_INTERFACE_V3
     \brief EVTCHN interface version 3
     \ingroup interfaces
@@ -318,7 +318,8 @@ typedef struct _XENBUS_EVTCHN_INTERFACE_V5 XENBUS_EVTCHN_INTERFACE, *PXENBUS_EVT
 
 #endif  // _WINDLL
 
-#define XENBUS_EVTCHN_INTERFACE_VERSION_MIN 3
+#define XENBUS_EVTCHN_INTERFACE_VERSION_MIN 1
 #define XENBUS_EVTCHN_INTERFACE_VERSION_MAX 5
 
 #endif  // _XENBUS_EVTCHN_INTERFACE_H
+
