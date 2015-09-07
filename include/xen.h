@@ -234,14 +234,6 @@ EventChannelUnmask(
     IN  ULONG   LocalPort
     );
 
-__checkReturn
-XEN_API
-NTSTATUS
-EventChannelStatus(
-    IN  ULONG               LocalPort,
-    OUT uint32_t            *Status // EVTCHNSTAT_*
-    );
-
 // GRANT TABLE
 
 __checkReturn

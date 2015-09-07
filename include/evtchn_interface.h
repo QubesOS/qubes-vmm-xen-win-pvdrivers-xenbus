@@ -205,20 +205,6 @@ typedef VOID
     IN  PXENBUS_EVTCHN_CHANNEL  Channel
     );
 
-/*! \typedef XENBUS_EVTCHN_STATUS
-    \brief Get the channel status
-
-    \param Interface The interface header
-    \param Channel The channel handle
-    \param Status The channel status (EVTCHNSTAT_*)
-*/
-typedef NTSTATUS
-(*XENBUS_EVTCHN_STATUS)(
-    IN  PINTERFACE              Interface,
-    IN  PXENBUS_EVTCHN_CHANNEL  Channel,
-    OUT ULONG                   *Status
-    );
-
 // {BE2440AC-1098-4150-AF4D-452FADCEF923}
 DEFINE_GUID(GUID_XENBUS_EVTCHN_INTERFACE,
 0xbe2440ac, 0x1098, 0x4150, 0xaf, 0x4d, 0x45, 0x2f, 0xad, 0xce, 0xf9, 0x23);
@@ -290,25 +276,7 @@ struct _XENBUS_EVTCHN_INTERFACE_V4 {
     XENBUS_EVTCHN_CLOSE     EvtchnClose;
 };
 
-/*! \struct _XENBUS_EVTCHN_INTERFACE_V5
-    \brief EVTCHN interface version 5
-    \ingroup interfaces
-*/
-struct _XENBUS_EVTCHN_INTERFACE_V5 {
-    INTERFACE               Interface;
-    XENBUS_EVTCHN_ACQUIRE   EvtchnAcquire;
-    XENBUS_EVTCHN_RELEASE   EvtchnRelease;
-    XENBUS_EVTCHN_OPEN      EvtchnOpen;
-    XENBUS_EVTCHN_BIND      EvtchnBind;
-    XENBUS_EVTCHN_UNMASK    EvtchnUnmask;
-    XENBUS_EVTCHN_SEND      EvtchnSend;
-    XENBUS_EVTCHN_TRIGGER   EvtchnTrigger;
-    XENBUS_EVTCHN_GET_PORT  EvtchnGetPort;
-    XENBUS_EVTCHN_CLOSE     EvtchnClose;
-    XENBUS_EVTCHN_STATUS    EvtchnStatus;
-};
-
-typedef struct _XENBUS_EVTCHN_INTERFACE_V5 XENBUS_EVTCHN_INTERFACE, *PXENBUS_EVTCHN_INTERFACE;
+typedef struct _XENBUS_EVTCHN_INTERFACE_V4 XENBUS_EVTCHN_INTERFACE, *PXENBUS_EVTCHN_INTERFACE;
 
 /*! \def XENBUS_EVTCHN
     \brief Macro at assist in method invocation
@@ -319,7 +287,7 @@ typedef struct _XENBUS_EVTCHN_INTERFACE_V5 XENBUS_EVTCHN_INTERFACE, *PXENBUS_EVT
 #endif  // _WINDLL
 
 #define XENBUS_EVTCHN_INTERFACE_VERSION_MIN 1
-#define XENBUS_EVTCHN_INTERFACE_VERSION_MAX 5
+#define XENBUS_EVTCHN_INTERFACE_VERSION_MAX 4
 
 #endif  // _XENBUS_EVTCHN_INTERFACE_H
 

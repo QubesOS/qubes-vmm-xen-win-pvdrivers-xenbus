@@ -60,7 +60,7 @@ typedef enum _XENBUS_STORE_PERMISSION_MASK {
 } XENBUS_STORE_PERMISSION_MASK;
 
 /*! \typedef XENBUS_STORE_PERMISSION
-    \brief Permissions for a single domain
+    \brief XenStore key permissions entry for a single domain
 */
 typedef struct _XENBUS_STORE_PERMISSION {
     USHORT Domain;
@@ -265,7 +265,7 @@ typedef VOID
     );
 
 /*! \typedef XENBUS_STORE_PERMISSIONS_SET
-    \brief Set permissions for a key in XenStore
+    \brief Set permissions for a XenStore key
 
     \param Interface The interface header
     \param Transaction The transaction handle (NULL if this is not

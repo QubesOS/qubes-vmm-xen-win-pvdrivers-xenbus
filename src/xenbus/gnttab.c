@@ -549,7 +549,6 @@ GnttabMapForeignPages(
     PXENBUS_GNTTAB_CONTEXT      Context = Interface->Context;
     ULONG                       PageIndex;
     PHYSICAL_ADDRESS            PageAddress;
-    BOOLEAN                     Leak = FALSE;
 
     status = FdoAllocateIoSpace(Context->Fdo, NumberPages * PAGE_SIZE, Address);
     if (!NT_SUCCESS(status))
@@ -572,23 +571,15 @@ GnttabMapForeignPages(
     return STATUS_SUCCESS;
 
 fail2:
-    Error("fail2: PageIndex = %lu, PageAddress = %p, Handle = %lu\n", PageAddress.QuadPart, Handles[PageIndex]);
+    Error("fail2: PageIndex %lu, PageAddress %p, Handle %lu\n", PageIndex, PageAddress.QuadPart, Handles[PageIndex]);
 
     while (PageIndex > 0) {
         --PageIndex;
         PageAddress.QuadPart -= PAGE_SIZE;
-
-        if (!NT_SUCCESS(GrantTableUnmapForeignPage(Handles[PageIndex], PageAddress))) {
-            // can't reuse the memory since it's still mapped in a foreign domain
-            Error("failed to unmap handle %lu at %p, leaking the whole range\n", Handles[PageIndex], PageAddress.QuadPart);
-            Leak = TRUE;
-        }
+        ASSERT(NT_SUCCESS(GrantTableUnmapForeignPage(Handles[PageIndex], PageAddress)));
     }
 
-    if (!Leak)
-        FdoFreeIoSpace(Context->Fdo, *Address, NumberPages * PAGE_SIZE);
-    else
-        Error("Leaking io memory: physical address %p, size 0x%lx\n", *Address, NumberPages * PAGE_SIZE);
+    FdoFreeIoSpace(Context->Fdo, *Address, NumberPages * PAGE_SIZE);
 
 fail1:
     Error("fail1: (%08x)\n", status);
@@ -611,8 +602,7 @@ GnttabUnmapForeignPages(
     PageAddress.QuadPart = Address.QuadPart;
 
     for (PageIndex = 0; PageIndex < NumberPages; PageIndex++) {
-        status = GrantTableUnmapForeignPage(Handles[PageIndex],
-                                            PageAddress);
+        status = GrantTableUnmapForeignPage(Handles[PageIndex], PageAddress);
         if (!NT_SUCCESS(status))
             goto fail1;
 

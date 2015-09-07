@@ -385,35 +385,3 @@ fail1:
 
     return status;
 }
-
-__checkReturn
-XEN_API
-NTSTATUS
-EventChannelStatus(
-    IN  ULONG               LocalPort,
-    OUT uint32_t            *Status // EVTCHNSTAT_*
-    )
-{
-    struct evtchn_status    op;
-    LONG_PTR                rc;
-    NTSTATUS                status;
-
-    op.dom = DOMID_SELF;
-    op.port = LocalPort;
-
-    rc = EventChannelOp(EVTCHNOP_status, &op);
-
-    if (rc < 0) {
-        ERRNO_TO_STATUS(-rc, status);
-        goto fail1;
-    }
-
-    *Status = op.status;
-
-    return STATUS_SUCCESS;
-
-fail1:
-    Error("fail1 (%08x)\n", status);
-
-    return status;
-}

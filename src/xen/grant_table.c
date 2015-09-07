@@ -172,7 +172,7 @@ GrantTableMapForeignPage(
     return STATUS_SUCCESS;
 
 fail2:
-    Error("op.status = %d\n", op.status);
+    Error("fail2: op.status = %d\n", op.status);
 fail1:
     Error("fail1 (%08x)\n", status);
 

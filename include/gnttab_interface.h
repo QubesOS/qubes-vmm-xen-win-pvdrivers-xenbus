@@ -164,13 +164,13 @@ typedef VOID
     );
 
 /*! \typedef XENBUS_GNTTAB_MAP_FOREIGN_PAGES
-    \brief Map foreign memory pages into the IO space
+    \brief Map foreign memory pages into the system address space
 
     \param Interface The interface header
-    \param Domain The domid of the domain that granted the page
+    \param Domain The domid of the foreign domain that granted the pages
     \param NumberPages Number of pages to map
     \param References Array of grant reference numbers shared by the foreign domain
-    \param ReadOnly If set, pages are mapped with read-only access
+    \param ReadOnly If TRUE, pages are mapped with read-only access
     \param Address The physical address that the foreign pages are mapped under
     (allocated from the PCI IO space)
     \param Handles An array of tracking numbers that represent the mapping
@@ -189,7 +189,7 @@ typedef NTSTATUS
     );
 
 /*! \typedef XENBUS_GNTTAB_UNMAP_FOREIGN_PAGES
-\brief Unmap a foreign memory page from the given physical address
+\brief Unmap foreign memory pages from the system address space
 
 \param Interface The interface header
 \param NumberPages Number of pages to unmap

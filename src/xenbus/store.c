@@ -236,7 +236,7 @@ fail1:
     return status;
 }
 
-// prepare request with known number of elements
+// prepare a request with known number of elements
 static NTSTATUS
 StorePrepareRequestFixed(
     IN  PXENBUS_STORE_CONTEXT       Context,
@@ -255,7 +255,7 @@ StorePrepareRequestFixed(
     ASSERT(IsZeroMemory(Request, sizeof (XENBUS_STORE_REQUEST)));
 
     status = STATUS_INVALID_PARAMETER;
-    if (NumberSegments > XENBUS_STORE_REQUEST_SEGMENT_COUNT - 1) // need one for header
+    if (NumberSegments > XENBUS_STORE_REQUEST_SEGMENT_COUNT - 1) // need one for the header
         goto fail1;
 
     if (Transaction != NULL) {
@@ -1866,8 +1866,6 @@ StorePermissionToString(
 
     ASSERT(BufferSize > 1);
 
-    // see http://xenbits.xen.org/docs/4.5-testing/misc/xenstore.txt
-
     switch (Permission->Mask) {
     case XS_PERM_WRITE:
         *Buffer = 'w';
@@ -2502,7 +2500,7 @@ static struct _XENBUS_STORE_INTERFACE_V1 StoreInterfaceVersion1 = {
     StoreTransactionEnd,
     StoreWatchAdd,
     StoreWatchRemove,
-    StorePoll,
+    StorePoll
 };
                      
 static struct _XENBUS_STORE_INTERFACE_V2 StoreInterfaceVersion2 = {
