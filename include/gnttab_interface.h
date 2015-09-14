@@ -172,9 +172,6 @@ typedef VOID
     \param References Array of grant reference numbers shared by the foreign domain
     \param ReadOnly If TRUE, pages are mapped with read-only access
     \param Address The physical address that the foreign pages are mapped under
-    (allocated from the PCI IO space)
-    \param Handles An array of tracking numbers that represent the mapping
-    of each individual page
 */
 
 typedef NTSTATUS
@@ -184,24 +181,19 @@ typedef NTSTATUS
     IN  ULONG                   NumberPages,
     IN  PULONG                  References,
     IN  BOOLEAN                 ReadOnly,
-    OUT PHYSICAL_ADDRESS        *Address,
-    OUT ULONG                   *Handles
+    OUT PHYSICAL_ADDRESS        *Address
     );
 
 /*! \typedef XENBUS_GNTTAB_UNMAP_FOREIGN_PAGES
-\brief Unmap foreign memory pages from the system address space
+    \brief Unmap foreign memory pages from the system address space
 
-\param Interface The interface header
-\param NumberPages Number of pages to unmap
-\param Address The physical address that the foreign pages are mapped under
-\param Handles An array of tracking numbers that represent the mapping
+    \param Interface The interface header
+    \param Address The physical address that the foreign pages are mapped under
 */
 typedef NTSTATUS
 (*XENBUS_GNTTAB_UNMAP_FOREIGN_PAGES)(
     IN  PINTERFACE              Interface,
-    IN  ULONG                   NumberPages,
-    IN  PHYSICAL_ADDRESS        Address,
-    IN  PULONG                  Handles
+    IN  PHYSICAL_ADDRESS        Address
     );
 
 // {763679C5-E5C2-4A6D-8B88-6BB02EC42D8E}
@@ -224,8 +216,8 @@ struct _XENBUS_GNTTAB_INTERFACE_V1 {
 };
 
 /*! \struct _XENBUS_GNTTAB_INTERFACE_V2
-\brief GNTTAB interface version 2 (added map/unmap foreign pages)
-\ingroup interfaces
+    \brief GNTTAB interface version 2
+    \ingroup interfaces
 */
 struct _XENBUS_GNTTAB_INTERFACE_V2 {
     INTERFACE                           Interface;

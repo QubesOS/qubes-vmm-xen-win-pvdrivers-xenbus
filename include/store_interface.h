@@ -54,17 +54,17 @@ typedef struct _XENBUS_STORE_WATCH          XENBUS_STORE_WATCH, *PXENBUS_STORE_W
     \brief Bitmask of XenStore key permissions
 */
 typedef enum _XENBUS_STORE_PERMISSION_MASK {
-    XS_PERM_NONE = 0,
-    XS_PERM_READ = 1,
-    XS_PERM_WRITE = 2,
+    XENBUS_STORE_PERM_NONE = 0,
+    XENBUS_STORE_PERM_READ = 1,
+    XENBUS_STORE_PERM_WRITE = 2,
 } XENBUS_STORE_PERMISSION_MASK;
 
 /*! \typedef XENBUS_STORE_PERMISSION
     \brief XenStore key permissions entry for a single domain
 */
 typedef struct _XENBUS_STORE_PERMISSION {
-    USHORT Domain;
-    XENBUS_STORE_PERMISSION_MASK Mask;
+    USHORT                          Domain;
+    XENBUS_STORE_PERMISSION_MASK    Mask;
 } XENBUS_STORE_PERMISSION, *PXENBUS_STORE_PERMISSION;
 
 /*! \typedef XENBUS_STORE_ACQUIRE
@@ -321,6 +321,7 @@ struct _XENBUS_STORE_INTERFACE_V2 {
     XENBUS_STORE_FREE               StoreFree;
     XENBUS_STORE_READ               StoreRead;
     XENBUS_STORE_PRINTF             StorePrintf;
+    XENBUS_STORE_PERMISSIONS_SET    StorePermissionsSet;
     XENBUS_STORE_REMOVE             StoreRemove;
     XENBUS_STORE_DIRECTORY          StoreDirectory;
     XENBUS_STORE_TRANSACTION_START  StoreTransactionStart;
@@ -328,7 +329,6 @@ struct _XENBUS_STORE_INTERFACE_V2 {
     XENBUS_STORE_WATCH_ADD          StoreWatchAdd;
     XENBUS_STORE_WATCH_REMOVE       StoreWatchRemove;
     XENBUS_STORE_POLL               StorePoll;
-    XENBUS_STORE_PERMISSIONS_SET    StorePermissionsSet;
 };
 
 typedef struct _XENBUS_STORE_INTERFACE_V2 XENBUS_STORE_INTERFACE, *PXENBUS_STORE_INTERFACE;

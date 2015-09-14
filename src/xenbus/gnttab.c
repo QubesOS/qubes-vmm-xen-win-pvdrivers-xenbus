@@ -40,6 +40,7 @@
 #include "dbg_print.h"
 #include "assert.h"
 #include "util.h"
+#include "hash_table.h"
 
 #define XENBUS_GNTTAB_MAXIMUM_FRAME_COUNT  32
 #define XENBUS_GNTTAB_ENTRY_PER_FRAME      (PAGE_SIZE / sizeof (grant_entry_v1_t))
@@ -68,6 +69,11 @@ struct _XENBUS_GNTTAB_ENTRY {
     grant_entry_v1_t    Entry;
 };
 
+typedef struct _XENBUS_GNTTAB_MAP_ENTRY {
+    ULONG   NumberPages;
+    ULONG   MapHandles[1];
+} XENBUS_GNTTAB_MAP_ENTRY, *PXENBUS_GNTTAB_MAP_ENTRY;
+
 struct _XENBUS_GNTTAB_CONTEXT {
     PXENBUS_FDO                 Fdo;
     KSPIN_LOCK                  Lock;
@@ -82,6 +88,7 @@ struct _XENBUS_GNTTAB_CONTEXT {
     PXENBUS_SUSPEND_CALLBACK    SuspendCallbackEarly;
     XENBUS_DEBUG_INTERFACE      DebugInterface;
     PXENBUS_DEBUG_CALLBACK      DebugCallback;
+    PXENBUS_HASH_TABLE          MapTable;
     LIST_ENTRY                  List;
 };
 
@@ -541,80 +548,124 @@ GnttabMapForeignPages(
     IN  ULONG                   NumberPages,
     IN  PULONG                  References,
     IN  BOOLEAN                 ReadOnly,
-    OUT PHYSICAL_ADDRESS        *Address,
-    OUT ULONG                   *Handles
+    OUT PHYSICAL_ADDRESS        *Address
     )
 {
-    NTSTATUS                    status;
     PXENBUS_GNTTAB_CONTEXT      Context = Interface->Context;
-    ULONG                       PageIndex;
+    LONG                        PageIndex;
     PHYSICAL_ADDRESS            PageAddress;
+    PXENBUS_GNTTAB_MAP_ENTRY    MapEntry;
+    NTSTATUS                    status;
 
-    status = FdoAllocateIoSpace(Context->Fdo, NumberPages * PAGE_SIZE, Address);
+    status = FdoAllocateIoSpace(Context->Fdo,
+                                NumberPages * PAGE_SIZE,
+                                Address);
     if (!NT_SUCCESS(status))
         goto fail1;
 
-    PageAddress.QuadPart = Address->QuadPart;
+    MapEntry = __GnttabAllocate(FIELD_OFFSET(XENBUS_GNTTAB_MAP_ENTRY,
+                                             MapHandles) +
+                                (NumberPages * sizeof (ULONG)));
 
-    for (PageIndex = 0; PageIndex < NumberPages; PageIndex++) {
+    status = STATUS_NO_MEMORY;
+    if (MapEntry == NULL)
+        goto fail2;
+
+    PageAddress.QuadPart = Address->QuadPart;
+    MapEntry->NumberPages = NumberPages;
+
+    for (PageIndex = 0; PageIndex < (LONG)NumberPages; PageIndex++) {
         status = GrantTableMapForeignPage(Domain,
                                           References[PageIndex],
                                           PageAddress,
                                           ReadOnly,
-                                          &(Handles[PageIndex]));
+                                          &MapEntry->MapHandles[PageIndex]);
         if (!NT_SUCCESS(status))
-            goto fail2;
+            goto fail3;
 
         PageAddress.QuadPart += PAGE_SIZE;
     }
 
+    status = HashTableAdd(Context->MapTable,
+                          (ULONG_PTR)Address->QuadPart,
+                          (ULONG_PTR)MapEntry);
+    if (!NT_SUCCESS(status))
+        goto fail4;
+
     return STATUS_SUCCESS;
 
-fail2:
-    Error("fail2: PageIndex %lu, PageAddress %p, Handle %lu\n", PageIndex, PageAddress.QuadPart, Handles[PageIndex]);
+fail4:
+    Error("fail4\n");
 
-    while (PageIndex > 0) {
-        --PageIndex;
+fail3:
+    Error("fail3\n");
+
+    while (--PageIndex >= 0) {
         PageAddress.QuadPart -= PAGE_SIZE;
-        ASSERT(NT_SUCCESS(GrantTableUnmapForeignPage(Handles[PageIndex], PageAddress)));
+        (VOID) GrantTableUnmapForeignPage(MapEntry->MapHandles[PageIndex],
+                                          PageAddress);
     }
+
+    __GnttabFree(MapEntry);
+
+fail2:
+    Error("fail2\n");
 
     FdoFreeIoSpace(Context->Fdo, *Address, NumberPages * PAGE_SIZE);
 
 fail1:
     Error("fail1: (%08x)\n", status);
+
     return status;
 }
 
 static NTSTATUS
 GnttabUnmapForeignPages(
     IN  PINTERFACE              Interface,
-    IN  ULONG                   NumberPages,
-    IN  PHYSICAL_ADDRESS        Address,
-    IN  PULONG                  Handles
+    IN  PHYSICAL_ADDRESS        Address
     )
 {
-    NTSTATUS                    status;
     PXENBUS_GNTTAB_CONTEXT      Context = Interface->Context;
     ULONG                       PageIndex;
     PHYSICAL_ADDRESS            PageAddress;
+    PXENBUS_GNTTAB_MAP_ENTRY    MapEntry;
+    NTSTATUS                    status;
+
+    status = HashTableLookup(Context->MapTable,
+                             (ULONG_PTR)Address.QuadPart,
+                             (PULONG_PTR)&MapEntry);
+    if (!NT_SUCCESS(status))
+        goto fail1;
+
+    status = HashTableRemove(Context->MapTable,
+                             (ULONG_PTR)Address.QuadPart);
+    if (!NT_SUCCESS(status))
+        goto fail2;
 
     PageAddress.QuadPart = Address.QuadPart;
 
-    for (PageIndex = 0; PageIndex < NumberPages; PageIndex++) {
-        status = GrantTableUnmapForeignPage(Handles[PageIndex], PageAddress);
-        if (!NT_SUCCESS(status))
-            goto fail1;
+    for (PageIndex = 0; PageIndex < MapEntry->NumberPages; PageIndex++) {
+        status = GrantTableUnmapForeignPage(MapEntry->MapHandles[PageIndex],
+                                            PageAddress);
+        BUG_ON(!NT_SUCCESS(status));
 
         PageAddress.QuadPart += PAGE_SIZE;
     }
 
-    FdoFreeIoSpace(Context->Fdo, Address, NumberPages * PAGE_SIZE);
+    FdoFreeIoSpace(Context->Fdo,
+                   Address,
+                   MapEntry->NumberPages * PAGE_SIZE);
+
+    __GnttabFree(MapEntry);
+
     return STATUS_SUCCESS;
 
+fail2:
+    Error("fail2\n");
+
 fail1:
-    Error("fail1: (%08x), leaking memory at %p, size 0x%lx. PageIndex = %lu, PageAddress = %p, Handle = %lu\n",
-          status, Address.QuadPart, NumberPages * PAGE_SIZE, PageIndex, PageAddress.QuadPart, Handles[PageIndex]);
+    Error("fail1: (%08x)\n", status);
+
     return status;
 }
 
@@ -872,9 +923,9 @@ static struct _XENBUS_GNTTAB_INTERFACE_V1   GnttabInterfaceVersion1 = {
     GnttabGetReference,
     GnttabDestroyCache
 };
-
+                     
 static struct _XENBUS_GNTTAB_INTERFACE_V2   GnttabInterfaceVersion2 = {
-    { sizeof(struct _XENBUS_GNTTAB_INTERFACE_V2), 2, NULL, NULL, NULL },
+    { sizeof (struct _XENBUS_GNTTAB_INTERFACE_V2), 2, NULL, NULL, NULL },
     GnttabAcquire,
     GnttabRelease,
     GnttabCreateCache,
@@ -933,11 +984,18 @@ GnttabInitialize(
     InitializeListHead(&(*Context)->List);
     KeInitializeSpinLock(&(*Context)->Lock);
 
+    status = HashTableCreate(&(*Context)->MapTable);
+    if (!NT_SUCCESS(status))
+        goto fail2;
+
     (*Context)->Fdo = Fdo;
 
     Trace("<====\n");
 
     return STATUS_SUCCESS;
+
+fail2:
+    Error("fail2\n");
 
 fail1:
     Error("fail1 (%08x)\n", status);
@@ -981,7 +1039,7 @@ GnttabGetInterface(
         GnttabInterface = (struct _XENBUS_GNTTAB_INTERFACE_V2 *)Interface;
 
         status = STATUS_BUFFER_OVERFLOW;
-        if (Size < sizeof(struct _XENBUS_GNTTAB_INTERFACE_V2))
+        if (Size < sizeof (struct _XENBUS_GNTTAB_INTERFACE_V2))
             break;
 
         *GnttabInterface = GnttabInterfaceVersion2;
@@ -1008,6 +1066,9 @@ GnttabTeardown(
     Trace("====>\n");
 
     Context->Fdo = NULL;
+
+    HashTableDestroy(Context->MapTable);
+    Context->MapTable = NULL;
 
     RtlZeroMemory(&Context->Lock, sizeof (KSPIN_LOCK));
     RtlZeroMemory(&Context->List, sizeof (LIST_ENTRY));

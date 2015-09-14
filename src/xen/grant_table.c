@@ -38,6 +38,38 @@
 #include "dbg_print.h"
 #include "assert.h"
 
+#pragma warning(push)
+#pragma warning(disable:4127)   // conditional expression is constant
+
+// Most of the GNTST_* values don't have meaningful NTSTATUS counterparts,
+// this macro translates those that do.
+#define GNTST_TO_STATUS(_gntst, _status)                    \
+        do {                                                \
+            switch (_gntst) {                               \
+            case GNTST_okay:                                \
+                _status = STATUS_SUCCESS;                   \
+                break;                                      \
+                                                            \
+            case GNTST_bad_handle:                          \
+                _status = STATUS_INVALID_HANDLE;            \
+                break;                                      \
+                                                            \
+            case GNTST_permission_denied:                   \
+                _status = STATUS_ACCESS_DENIED;             \
+                break;                                      \
+                                                            \
+            case GNTST_eagain:                              \
+                _status = STATUS_RETRY;                     \
+                break;                                      \
+                                                            \
+            default:                                        \
+                _status = STATUS_UNSUCCESSFUL;              \
+                break;                                      \
+            }                                               \
+        } while (FALSE)
+
+#pragma warning(pop)
+
 static LONG_PTR
 GrantTableOp(
     IN  ULONG   Command,
@@ -144,8 +176,8 @@ GrantTableMapForeignPage(
     )
 {
     struct gnttab_map_grant_ref op;
-    LONG_PTR rc;
-    NTSTATUS status;
+    LONG_PTR                    rc;
+    NTSTATUS                    status;
 
     RtlZeroMemory(&op, sizeof(op));
     op.dom = Domain;
@@ -163,7 +195,14 @@ GrantTableMapForeignPage(
     }
 
     if (op.status != GNTST_okay) {
-        status = STATUS_UNSUCCESSFUL;
+        Warning("%u:%u -> %u.%u failed (%d)\n",
+                op.dom,
+                op.ref,
+                Address.HighPart,
+                Address.LowPart,
+                op.status);
+
+        GNTST_TO_STATUS(op.status, status);
         goto fail2;
     }
 
@@ -172,7 +211,8 @@ GrantTableMapForeignPage(
     return STATUS_SUCCESS;
 
 fail2:
-    Error("fail2: op.status = %d\n", op.status);
+    Error("fail2\n");
+
 fail1:
     Error("fail1 (%08x)\n", status);
 
@@ -183,13 +223,13 @@ __checkReturn
 XEN_API
 NTSTATUS
 GrantTableUnmapForeignPage(
-    IN  ULONG                   Handle,
-    IN  PHYSICAL_ADDRESS        Address
+    IN  ULONG                     Handle,
+    IN  PHYSICAL_ADDRESS          Address
     )
 {
     struct gnttab_unmap_grant_ref op;
-    LONG_PTR rc;
-    NTSTATUS status;
+    LONG_PTR                      rc;
+    NTSTATUS                      status;
 
     RtlZeroMemory(&op, sizeof(op));
     op.handle = Handle;
@@ -203,14 +243,20 @@ GrantTableUnmapForeignPage(
     }
 
     if (op.status != GNTST_okay) {
-        status = STATUS_UNSUCCESSFUL;
+        Warning("%u.%u failed (%d)\n",
+                Address.HighPart,
+                Address.LowPart,
+                op.status);
+
+        GNTST_TO_STATUS(op.status, status);
         goto fail2;
     }
 
     return STATUS_SUCCESS;
 
 fail2:
-    Error("op.status = %d\n", op.status);
+    Error("fail2\n");
+
 fail1:
     Error("fail1 (%08x)\n", status);
 

@@ -131,6 +131,9 @@ struct _XENBUS_STORE_CONTEXT {
     LIST_ENTRY                          WatchList;
     LIST_ENTRY                          BufferList;
     KDPC                                Dpc;
+    ULONG                               Polls;
+    ULONG                               Dpcs;
+    ULONG                               Events;
     XENBUS_STORE_RESPONSE               Response;
     XENBUS_EVTCHN_INTERFACE             EvtchnInterface;
     PHYSICAL_ADDRESS                    Address;
@@ -895,6 +898,8 @@ StorePollLocked(
 
     ASSERT3U(KeGetCurrentIrql(), ==, DISPATCH_LEVEL);
 
+    Context->Polls++;
+
     do {
         Read = Written = 0;
 
@@ -944,6 +949,13 @@ StoreDpc(
     KeReleaseSpinLockFromDpcLevel(&Context->Lock);
 }
 
+#define TIME_US(_us)        ((_us) * 10)
+#define TIME_MS(_ms)        (TIME_US((_ms) * 1000))
+#define TIME_S(_s)          (TIME_MS((_s) * 1000))
+#define TIME_RELATIVE(_t)   (-(_t))
+
+#define XENBUS_STORE_POLL_PERIOD 5
+
 static PXENBUS_STORE_RESPONSE
 StoreSubmitRequest(
     IN  PXENBUS_STORE_CONTEXT   Context,
@@ -952,6 +964,7 @@ StoreSubmitRequest(
 {
     PXENBUS_STORE_RESPONSE      Response;
     KIRQL                       Irql;
+    LARGE_INTEGER               Timeout;
 
     ASSERT3U(Request->State, ==, XENBUS_STORE_REQUEST_PREPARED);
 
@@ -962,11 +975,25 @@ StoreSubmitRequest(
     KeAcquireSpinLockAtDpcLevel(&Context->Lock);
 
     InsertTailList(&Context->SubmittedList, &Request->ListEntry);
+
     Request->State = XENBUS_STORE_REQUEST_SUBMITTED;
+    StorePollLocked(Context);
+    KeMemoryBarrier();
+
+    Timeout.QuadPart = TIME_RELATIVE(TIME_S(XENBUS_STORE_POLL_PERIOD));
 
     while (Request->State != XENBUS_STORE_REQUEST_COMPLETED) {
+        NTSTATUS    status;
+
+        status = XENBUS_EVTCHN(Wait,
+                               &Context->EvtchnInterface,
+                               Context->Channel,
+                               &Timeout);
+        if (status == STATUS_TIMEOUT)
+            Warning("TIMED OUT\n");
+
         StorePollLocked(Context);
-        SchedYield();
+        KeMemoryBarrier();
     }
 
     KeReleaseSpinLockFromDpcLevel(&Context->Lock);
@@ -976,7 +1003,7 @@ StoreSubmitRequest(
            Response->Header.type == XS_ERROR ||
            Response->Header.type == Request->Header.type);
 
-    RtlZeroMemory(Request, sizeof(XENBUS_STORE_REQUEST));
+    RtlZeroMemory(Request, sizeof (XENBUS_STORE_REQUEST));
 
     KeLowerIrql(Irql);
 
@@ -1845,48 +1872,72 @@ fail1:
 
 static VOID
 StorePoll(
-    IN  PINTERFACE  Interface
+    IN  PINTERFACE          Interface
     )
 {
-    PXENBUS_STORE_CONTEXT  Context = Interface->Context;
+    PXENBUS_STORE_CONTEXT   Context = Interface->Context;
 
     KeAcquireSpinLockAtDpcLevel(&Context->Lock);
-    StorePollLocked(Context);
+    if (Context->References != 0)
+        StorePollLocked(Context);
     KeReleaseSpinLockFromDpcLevel(&Context->Lock);
 }
 
 static NTSTATUS
 StorePermissionToString(
-    IN  PXENBUS_STORE_PERMISSION Permission,
-    IN  ULONG BufferSize,
-    OUT PCHAR Buffer
+    IN  PXENBUS_STORE_PERMISSION    Permission,
+    OUT PCHAR                       Buffer,
+    IN  ULONG                       BufferSize,
+    OUT PULONG                      UsedSize
     )
 {
-    NTSTATUS status = STATUS_INVALID_PARAMETER;
+    size_t                          Remaining;
+    NTSTATUS                        status;
 
     ASSERT(BufferSize > 1);
 
     switch (Permission->Mask) {
-    case XS_PERM_WRITE:
-        *Buffer = 'w';
-        break;
-    case XS_PERM_READ:
-        *Buffer = 'r';
-        break;
-    case XS_PERM_READ | XS_PERM_WRITE:
-        *Buffer = 'b';
-        break;
-    case XS_PERM_NONE:
+    case XENBUS_STORE_PERM_NONE:
         *Buffer = 'n';
         break;
+
+    case XENBUS_STORE_PERM_READ:
+        *Buffer = 'r';
+        break;
+
+    case XENBUS_STORE_PERM_WRITE:
+        *Buffer = 'w';
+        break;
+
+    case XENBUS_STORE_PERM_READ | XENBUS_STORE_PERM_WRITE:
+        *Buffer = 'b';
+        break;
+
     default:
+        status = STATUS_INVALID_PARAMETER;
         goto fail1;
     }
 
-    return RtlStringCbPrintfA(Buffer + 1, BufferSize - 1, "%u", Permission->Domain);
+    status = RtlStringCbPrintfExA(Buffer + 1,
+                                  BufferSize - 1,
+                                  NULL,
+                                  &Remaining,
+                                  0,
+                                  "%u",
+                                  Permission->Domain);
+    if (!NT_SUCCESS(status))
+        goto fail2;
+
+    *UsedSize = BufferSize - (ULONG)Remaining + 1;
+
+    return STATUS_SUCCESS;
+
+fail2:
+    Error("fail2\n");
 
 fail1:
     Error("fail1 (%08x)\n", status);
+
     return status;
 }
 
@@ -1904,82 +1955,82 @@ StorePermissionsSet(
     XENBUS_STORE_REQUEST            Request;
     PXENBUS_STORE_RESPONSE          Response;
     NTSTATUS                        status;
-    XENBUS_STORE_SEGMENT            Segments[XENBUS_STORE_REQUEST_SEGMENT_COUNT];
-    ULONG                           Index, BufferSize;
-    PCHAR                           Path = NULL;
+    ULONG                           Index;
+    ULONG                           Length;
+    ULONG                           Used;
+    PCHAR                           Path;
+    PCHAR                           PermissionString;
+    PCHAR                           Segment;
 
-    status = STATUS_INVALID_PARAMETER;
-    if (NumberPermissions > XENBUS_STORE_REQUEST_SEGMENT_COUNT - 2) // 1 for path, 1 for header in StorePrepareRequestFixed
+    PermissionString = __StoreAllocate(XENSTORE_PAYLOAD_MAX);
+
+    status = STATUS_NO_MEMORY;
+    if (PermissionString == NULL)
         goto fail1;
 
-    if (Prefix != NULL) {
-        // we're concatenating it here instead of passing to StorePrepareRequestFixed to reduce the number of segments used
-        status = STATUS_NO_MEMORY;
-        Path = __StoreAllocate(XENSTORE_ABS_PATH_MAX);
-        if (Path == NULL)
-            goto fail2;
+    if (Prefix == NULL)
+        Length = (ULONG)strlen(Node) + sizeof (CHAR);
+    else
+        Length = (ULONG)strlen(Prefix) + 1 + (ULONG)strlen(Node) + sizeof (CHAR);
 
-        status = RtlStringCbPrintfA(Path, XENSTORE_ABS_PATH_MAX, "%s/%s", Prefix, Node);
-        ASSERT(NT_SUCCESS(status));
-        Node = Path;
-    }
+    Path = __StoreAllocate(Length);
 
-    RtlZeroMemory(&Request, sizeof(XENBUS_STORE_REQUEST));
-    RtlZeroMemory(Segments, sizeof(Segments));
+    if (Path == NULL)
+        goto fail2;
 
-    Segments[0].Data = Node; // path
-    Segments[0].Offset = 0;
-    Segments[0].Length = (ULONG)strlen(Node) + 1; // zero terminator required
+    status = (Prefix == NULL) ?
+             RtlStringCbPrintfA(Path, Length, "%s", Node) :
+             RtlStringCbPrintfA(Path, Length, "%s/%s", Prefix, Node);
+    ASSERT(NT_SUCCESS(status));
 
-    BufferSize = 16;
-    for (Index = 0; Index < NumberPermissions; Index++) {
-        Segments[Index + 1].Data = __StoreAllocate(BufferSize);
-        if (Segments[Index + 1].Data == NULL)
+    RtlZeroMemory(&Request, sizeof (XENBUS_STORE_REQUEST));
+
+    for (Index = 0, Segment = PermissionString, Length = XENSTORE_PAYLOAD_MAX;
+         Index < NumberPermissions;
+         Index++) {
+        status = StorePermissionToString(&Permissions[Index],
+                                         Segment,
+                                         Length,
+                                         &Used);
+        if (!NT_SUCCESS(status))
             goto fail3;
 
-        status = StorePermissionToString(&Permissions[Index], BufferSize, Segments[Index+1].Data);
-        if (!NT_SUCCESS(status))
-            goto fail4;
-
-        Segments[Index + 1].Length = (ULONG)strlen(Segments[Index + 1].Data) + 1; // zero terminator required
+        Segment += Used;
+        Length -= Used;
     }
 
-    status = StorePrepareRequestFixed(Context,
-                                      &Request,
-                                      Transaction,
-                                      XS_SET_PERMS,
-                                      Segments,
-                                      NumberPermissions + 1);
-
+    status = StorePrepareRequest(Context,
+                                 &Request,
+                                 Transaction,
+                                 XS_SET_PERMS,
+                                 Path, strlen(Path),
+                                 "", 1,
+                                 PermissionString, XENSTORE_PAYLOAD_MAX - Length,
+                                 NULL, 0);
     if (!NT_SUCCESS(status))
-        goto fail5;
+        goto fail4;
 
     Response = StoreSubmitRequest(Context, &Request);
 
     status = STATUS_NO_MEMORY;
     if (Response == NULL)
-        goto fail6;
+        goto fail5;
 
     status = StoreCheckResponse(Response);
     if (!NT_SUCCESS(status))
-        goto fail7;
+        goto fail6;
 
     StoreFreeResponse(Response);
-    ASSERT(IsZeroMemory(&Request, sizeof(XENBUS_STORE_REQUEST)));
-    for (Index = 0; Index < NumberPermissions; Index++)
-        __StoreFree(Segments[Index + 1].Data);
+    ASSERT(IsZeroMemory(&Request, sizeof (XENBUS_STORE_REQUEST)));
 
-    if (Path != NULL)
-        __StoreFree(Path);
+    __StoreFree(Path);
+    __StoreFree(PermissionString);
 
     return STATUS_SUCCESS;
 
-fail7:
-    Error("fail7\n");
-    StoreFreeResponse(Response);
-
 fail6:
     Error("fail6\n");
+    StoreFreeResponse(Response);
 
 fail5:
     Error("fail5\n");
@@ -1989,20 +2040,18 @@ fail4:
 
 fail3:
     Error("fail3\n");
-    for (Index = 0; Index < NumberPermissions; Index++)
-        if (Segments[Index + 1].Data != NULL)
-            __StoreFree(Segments[Index + 1].Data);
 
-    if (Path != NULL)
-        __StoreFree(Path);
+    __StoreFree(Path);
+    ASSERT(IsZeroMemory(&Request, sizeof (XENBUS_STORE_REQUEST)));
 
 fail2:
     Error("fail2\n");
 
+    __StoreFree(PermissionString);
 
 fail1:
     Error("fail1 (%08x)\n", status);
-    ASSERT(IsZeroMemory(&Request, sizeof(XENBUS_STORE_REQUEST)));
+
     return status;
 }
 
@@ -2022,7 +2071,10 @@ StoreEvtchnCallback(
 
     ASSERT(Context != NULL);
 
-    KeInsertQueueDpc(&Context->Dpc, NULL, NULL);
+    Context->Events++;
+
+    if (KeInsertQueueDpc(&Context->Dpc, NULL, NULL))
+        Context->Dpcs++;
 
     return TRUE;
 }
@@ -2069,6 +2121,9 @@ StoreEnable(
                   &Context->EvtchnInterface,
                   Context->Channel,
                   FALSE);
+
+    // Trigger an initial poll
+    KeInsertQueueDpc(&Context->Dpc, NULL, NULL);
 }
 
 static PHYSICAL_ADDRESS
@@ -2190,6 +2245,13 @@ StoreDebugCallback(
                      Shared->rsp_cons,
                      Shared->rsp_prod);
     }
+
+    XENBUS_DEBUG(Printf,
+                 &Context->DebugInterface,
+                 "Events = %lu Dpcs = %lu Polls = %lu\n",
+                 Context->Events,
+                 Context->Dpcs,
+                 Context->Polls);
 
     if (!IsListEmpty(&Context->BufferList)) {
         PLIST_ENTRY ListEntry;
@@ -2472,6 +2534,7 @@ StoreRelease(
     XENBUS_SUSPEND(Release, &Context->SuspendInterface);
 
     StoreDisable(Context);
+    StorePollLocked(Context);
     RtlZeroMemory(&Context->Response, sizeof (XENBUS_STORE_RESPONSE));
 
     XENBUS_EVTCHN(Release, &Context->EvtchnInterface);
@@ -2504,20 +2567,20 @@ static struct _XENBUS_STORE_INTERFACE_V1 StoreInterfaceVersion1 = {
 };
                      
 static struct _XENBUS_STORE_INTERFACE_V2 StoreInterfaceVersion2 = {
-    { sizeof(struct _XENBUS_STORE_INTERFACE_V2), 2, NULL, NULL, NULL },
+    { sizeof (struct _XENBUS_STORE_INTERFACE_V2), 2, NULL, NULL, NULL },
     StoreAcquire,
     StoreRelease,
     StoreFree,
     StoreRead,
     StorePrintf,
+    StorePermissionsSet,
     StoreRemove,
     StoreDirectory,
     StoreTransactionStart,
     StoreTransactionEnd,
     StoreWatchAdd,
     StoreWatchRemove,
-    StorePoll,
-    StorePermissionsSet,
+    StorePoll
 };
 
 NTSTATUS
@@ -2625,7 +2688,7 @@ StoreGetInterface(
         StoreInterface = (struct _XENBUS_STORE_INTERFACE_V2 *)Interface;
 
         status = STATUS_BUFFER_OVERFLOW;
-        if (Size < sizeof(struct _XENBUS_STORE_INTERFACE_V2))
+        if (Size < sizeof (struct _XENBUS_STORE_INTERFACE_V2))
             break;
 
         *StoreInterface = StoreInterfaceVersion2;
@@ -2653,6 +2716,10 @@ StoreTeardown(
 
     ASSERT3U(KeGetCurrentIrql(), ==, PASSIVE_LEVEL);
     KeFlushQueuedDpcs();
+
+    Context->Polls = 0;
+    Context->Dpcs = 0;
+    Context->Events = 0;
 
     Context->Fdo = NULL;
 
